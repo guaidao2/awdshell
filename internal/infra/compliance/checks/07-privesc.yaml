@@ -1,0 +1,156 @@
+version: 1
+meta:
+  name: "提权路径（除 SUID 之外）"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+# 这一组按渗透测试里枚举本地提权的常见维度组织，覆盖 SUID 之外的路径：
+# capabilities、sudo 配置、计划任务与 systemd 单元的可写性、特权组、NFS 导出选项、
+# PATH 劫持、环境变量继承、散落的凭据、内核版本。
+#
+# 取向：这些检查是给防守方做自查用的 —— 查出问题就修，不是为了利用。
+# 因此需要人工确认的项（凭据文件、内核版本）只呈现事实，不下"不合规"结论。
+
+checks:
+
+  - id: CHK-PE-001
+    title: "可执行文件没有危险 capabilities"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.4 入侵防范", "Linux capabilities"]
+    command: "if command -v getcap >/dev/null 2>&1; then getcap -r /usr/bin /usr/sbin /bin /sbin /usr/lib /usr/libexec /usr/local /opt /home /tmp /var/tmp 2>/dev/null | grep -E 'cap_(setuid|setgid|sys_admin|sys_ptrace|sys_module|dac_read_search|dac_override|chown|fowner|sys_rawio|bpf|perfmon)\\b' | head -n 20; else echo NO_GETCAP; fi"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉不需要的能力位：setcap -r <文件>。cap_setuid / cap_setgid 等价于可直接切换身份，cap_dac_read_search 可读任意文件，cap_sys_admin 几乎是完整的 root。"
+    note: "输出 NO_GETCAP 表示目标机没装 libcap（没有 getcap 命令），此时无法核查这一项。"
+    timeout: 25
+
+  - id: CHK-PE-002
+    title: "sudo 未对危险命令配置免密"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.2 访问控制", "sudo 提权"]
+    command: "grep -rhE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -E '(bash|/sh|dash|zsh|su|python|perl|ruby|php|find|vim|vi|less|more|awk|sed|env|nmap|tar|cp|mv|chmod|chown|dd|gdb|tee|systemctl|docker)' | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "取消这些条目的 NOPASSWD，或收紧到具体的固定参数。免密执行上述任一程序都等价于免密 root —— 例如 sudo find / -exec sh \\; 。"
+    note: "普通命令（如 systemctl restart nginx）的 NOPASSWD 通常是有意为之，不在这条清单里。"
+
+  - id: CHK-PE-003
+    title: "计划任务与 systemd 单元不可被普通用户改写"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.2 访问控制", "cron / systemd 提权"]
+    command: "find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /etc/crontab /var/spool/cron /etc/systemd/system /lib/systemd/system -xdev \\( -type f -o -type d \\) -perm -0002 2>/dev/null | head -n 15"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉其他用户写权限（chmod o-w <路径>）。这些位置由 root 执行，任何人能改就等于能执行任意代码。"
+    timeout: 20
+
+  - id: CHK-PE-004
+    title: "计划任务目录与文件权限（人工确认）"
+    category: 提权风险
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "ls -ld /etc/crontab /etc/cron.d /etc/cron.daily /var/spool/cron /var/spool/cron/crontabs 2>/dev/null | awk '{print $1, $3, $4, $9}'; echo '--- 任务内容 ---'; grep -rhE '^[^#]' /etc/crontab /etc/cron.d/ 2>/dev/null | head -n 15"
+    expect:
+      type: manual
+    remedy: "确认 /etc/crontab 与 /etc/cron.d 下所有权限为 root:root，且被调用的脚本本身也不可被他人改写。"
+    note: "重点看任务调用的脚本路径 —— 如果脚本本身可写，cron 的权限再正确也没用。"
+
+  - id: CHK-PE-005
+    title: "账号文件不可被组或其他用户写入"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "find /etc -maxdepth 1 \\( -name passwd -o -name shadow -o -name group -o -name gshadow -o -name sudoers \\) -perm -0002 2>/dev/null | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "chmod 644 /etc/passwd /etc/group、chmod 640 /etc/shadow /etc/gshadow、chmod 440 /etc/sudoers，并确认属主是 root。能改 /etc/passwd 就等于能直接加一个 UID 0 的账号。"
+    timeout: 15
+
+  - id: CHK-PE-006
+    title: "sudo 未保留可劫持的环境变量"
+    category: 提权风险
+    severity: high
+    refs: ["等保 8.1.4.2 访问控制", "环境变量提权"]
+    command: "grep -rhE 'env_keep|env_reset|secure_path' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)env_keep[^\n]*(LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|PERL5LIB|RUBYLIB|NODE_PATH|GEM_PATH)'
+    remedy: "去掉 sudoers 里对这些变量的 env_keep 保留。保留 LD_PRELOAD 后，任何能 sudo 的账号都可以加载自定义库并以 root 执行代码。"
+    note: "同时建议确认配置了 default env_reset 与 secure_path。"
+
+  - id: CHK-PE-007
+    title: "无普通用户处于 docker 等高权限组"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.2 访问控制", "容器组提权"]
+    command: "for g in docker lxd disk adm; do members=$(getent group $g 2>/dev/null | awk -F: '{print $4}' | tr ',' '\\n' | grep -vE '^(|root)$' | tr '\\n' ' '); [ -n \"$members\" ] && echo \"$g: $members\"; done"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "把这些用户从特权组移除（gpasswd -d 用户 组名）。docker 组成员可通过挂载宿主根目录获得 root；disk 组可直接读写块设备。"
+    note: "输出为空表示没有普通用户处于这些组。adm 组风险较低（只读日志），如业务需要可酌情保留。"
+
+  - id: CHK-PE-008
+    title: "NFS 导出未使用 no_root_squash"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.2 访问控制", "NFS 提权"]
+    command: "grep -vE '^[[:space:]]*(#|$)' /etc/exports 2>/dev/null | grep -i 'no_root_squash' | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉导出选项中的 no_root_squash。它让客户端上的 root 在服务端也拥有 root 权限，配合 SUID 程序可直接提权。"
+    note: "没有 /etc/exports 或未启用 NFS 时这一项自然通过。"
+
+  - id: CHK-PE-009
+    title: "系统 PATH 不含全局可写目录"
+    category: 提权风险
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范", "PATH 劫持"]
+    command: "grep -rhE '^[[:space:]]*(export[[:space:]]+)?PATH=' /etc/profile /etc/bashrc /etc/environment /etc/profile.d/*.sh /root/.bashrc /root/.profile 2>/dev/null | grep -E ':(/tmp|/var/tmp|/dev/shm|\\.)($|:)' | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "把 /tmp、/var/tmp、. 这类可写路径从系统 PATH 里去掉。root 执行脚本时若 PATH 含可写目录，任何人都能放一个同名程序劫持执行。"
+    note: "这里检查的是系统级 PATH 配置文件；用户自己的 PATH 设置不在核查范围内。"
+
+  - id: CHK-PE-010
+    title: "家目录中散落的凭据文件（人工确认）"
+    category: 提权风险
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "find /root /home -xdev -maxdepth 4 \\( -name 'id_rsa' -o -name 'id_dsa' -o -name 'id_ecdsa' -o -name 'id_ed25519' -o -name '*.pem' -o -name '*.key' -o -name '.pgpass' -o -name '.my.cnf' -o -name '.netrc' -o -name '.git-credentials' -o -name 'credentials' -o -name '.env' -o -name '*.kdbx' \\) -type f 2>/dev/null | head -n 25"
+    expect:
+      type: manual
+    remedy: "确认这些文件都是业务需要的，并检查权限（私钥应为 600）。不需要的及时清理；散落的凭据文件是本地提权最容易被忽略的一环。"
+    note: "只列清单不下结论 —— 私钥本身是正常的，问题在于权限过宽或早已废弃却还留在机器上。"
+
+  - id: CHK-PE-011
+    title: "内核版本（比对已知提权漏洞）"
+    category: 提权风险
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "uname -r; echo '---'; head -n1 /proc/version 2>/dev/null; echo '---'; cat /etc/os-release 2>/dev/null | grep -E '^(PRETTY_NAME|VERSION)=' | head -n2"
+    expect:
+      type: manual
+    remedy: "对照内核版本升级补丁。常见影响面较大的内核提权漏洞：CVE-2016-5195（DirtyCow，< 4.8.3）、CVE-2022-0847（DirtyPipe，5.8 ~ 5.16.11）、CVE-2021-3493（overlayfs，Ubuntu 内核）、CVE-2021-22555（netfilter，2.6.19 ~ 5.12）。"
+    note: "内核版本需要结合发行版的补丁级别判断 —— 同一版本号在不同发行版上是否已修复并不相同，这里只呈现事实供人工比对。"
+
+  - id: CHK-PE-012
+    title: "临时目录下存在可执行文件（人工确认）"
+    category: 提权风险
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "find /tmp /var/tmp /dev/shm -xdev -type f -perm -u+x 2>/dev/null | head -n 20"
+    expect:
+      type: manual
+    remedy: "确认这些文件的来源。临时目录里的可执行文件是落地的常见位置；不属于任何业务的应当清理并排查来源。"
+    note: "系统运行期间（如软件安装、编译）会有正常的临时可执行文件，需要结合时间与内容判断。"

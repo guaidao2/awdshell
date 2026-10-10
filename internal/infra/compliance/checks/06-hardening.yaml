@@ -1,0 +1,106 @@
+version: 1
+meta:
+  name: "系统加固"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+checks:
+
+  - id: CHK-HD-001
+    title: "未加载不使用的文件系统模块"
+    category: 系统加固
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 1.1"]
+    command: "lsmod 2>/dev/null | awk 'NR>1{print $1}' | grep -E '^(cramfs|freevxfs|jffs2|hfs|hfsplus|udf|squashfs)$' | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "不使用这些文件系统时禁止加载：在 /etc/modprobe.d/ 下写 install <模块> /bin/true 并 rmmod。少一个可识别的文件系统，就少一条从外部介质带入载荷的路径。"
+    note: "squashfs 被 snap 等打包格式使用，若机器上有类 snap 应用请酌情保留。"
+
+  - id: CHK-HD-002
+    title: "/tmp 分区挂载选项（人工确认）"
+    category: 系统加固
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 1.1"]
+    command: "findmnt -no SOURCE,TARGET,OPTIONS /tmp 2>/dev/null || echo 'NOT_SEPARATE: /tmp 未独立挂载'; findmnt -no SOURCE,TARGET,OPTIONS /var/tmp 2>/dev/null; findmnt -no SOURCE,TARGET,OPTIONS /dev/shm 2>/dev/null"
+    expect:
+      type: manual
+    remedy: "为 /tmp 单独分区并加上 noexec,nosuid,nodev。仅靠目录权限不够 —— 独立分区加 noexec 才能真正阻止从临时目录执行落地程序。"
+    note: "很多业务会把临时文件放在 /tmp 并需要执行，启用 noexec 前请先确认影响。"
+
+  - id: CHK-HD-003
+    title: "系统安全更新情况（人工确认）"
+    category: 系统加固
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "if command -v apt-get >/dev/null 2>&1; then apt-get -s upgrade 2>/dev/null | grep -cE '^Inst'; apt-get -s upgrade 2>/dev/null | grep -E '^Inst.*security' | head -n 8; elif command -v dnf >/dev/null 2>&1; then dnf -q check-update --security 2>/dev/null | grep -c .; elif command -v yum >/dev/null 2>&1; then yum -q check-update --security 2>/dev/null | grep -c .; else echo NO_PKG_MANAGER; fi"
+    expect:
+      type: manual
+    remedy: "及时安装安全更新。等保要求'及时修补已知漏洞'，需要结合业务窗口制定补丁计划；关键系统先在测试环境验证。"
+    note: "第一行数字是待更新包总数，其后列出带 security 标记的条目。不同发行版的包管理器输出格式不同。"
+
+  - id: CHK-HD-004
+    title: "无来源不明的已加载内核模块"
+    category: 系统加固
+    severity: critical
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "lsmod 2>/dev/null | awk 'NR>1{print $1}' | while read m; do modinfo \"$m\" >/dev/null 2>&1 || echo \"$m\"; done | head -n 10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "对输出中的模块逐一排查来源（modinfo 查不到信息的模块通常不是发行版提供的）。确认是 rootkit 时需隔离主机并做完整取证，不要直接重启。"
+    note: "自编译模块（如第三方驱动）会正常出现在这里，需结合业务判断。"
+
+  - id: CHK-HD-005
+    title: "救援与单用户模式需要认证"
+    category: 系统加固
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "grep -hE 'sulogin|ExecStart' /usr/lib/systemd/system/rescue.service /usr/lib/systemd/system/emergency.service 2>/dev/null | head -n 6; grep -hE 'SINGLE|sulogin' /etc/inittab /etc/sysconfig/init 2>/dev/null | head -n 4"
+    expect:
+      type: manual
+    remedy: "确保救援模式通过 sulogin 要求 root 口令。若本地物理接触即可进入无口令的单用户模式，前面所有访问控制都可以被绕过。"
+
+  - id: CHK-HD-006
+    title: "未暴露多余的内核信息"
+    category: 系统加固
+    severity: low
+    refs: ["CIS 1.5"]
+    command: "for k in kernel.dmesg_restrict kernel.kptr_restrict kernel.perf_event_paranoid; do printf '%s=%s\\n' \"$k\" \"$(sysctl -n $k 2>/dev/null)\"; done"
+    expect:
+      type: regex_not_match
+      pattern: 'dmesg_restrict=0|kptr_restrict=0'
+    remedy: "设置 kernel.dmesg_restrict = 1、kernel.kptr_restrict = 1（或 2）。否则普通用户可以读内核日志与符号地址，为编写内核漏洞利用提供便利。"
+
+  - id: CHK-HD-007
+    title: "时间同步已启用"
+    category: 系统加固
+    severity: medium
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "timedatectl 2>/dev/null | grep -iE 'NTP|synchronized' | head -n 3; systemctl is-active systemd-timesyncd chronyd ntpd chrony 2>/dev/null | head -n 4"
+    expect:
+      type: manual
+    remedy: "启用时间同步（systemd-timesyncd / chrony / ntp）。时间不准会让日志时间线错乱，也会影响证书校验与审计追溯。"
+
+  - id: CHK-HD-008
+    title: "生产环境未安装多余编译与调试工具（人工确认）"
+    category: 系统加固
+    severity: low
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "for c in gcc cc g++ make gdb strace ltrace tcpdump wireshark nc ncat socat nmap john hashcat; do command -v $c >/dev/null 2>&1 && echo $c; done | head -n 20"
+    expect:
+      type: manual
+    remedy: "遵循最小安装原则，生产环境移除不需要的编译与渗透工具。这些工具在系统被入侵后会被直接用来提权与横向。"
+    note: "运维跳板机或确有用途的主机可保留，需按业务判断。"
+
+  - id: CHK-HD-009
+    title: "引导加载器已设口令保护（人工确认）"
+    category: 系统加固
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "grep -hE '^password|^set superusers|password_pbkdf2' /boot/grub/grub.cfg /boot/grub2/grub.cfg /etc/grub.d/40_custom /etc/grub.d/01_users 2>/dev/null | head -n 4; echo '--- 无输出表示未设 GRUB 口令 ---'"
+    expect:
+      type: manual
+    remedy: "为 GRUB 设置 superusers 与 pbkdf2 口令，防止本地接触者通过编辑内核启动参数（如 init=/bin/bash）直接取得 root。"

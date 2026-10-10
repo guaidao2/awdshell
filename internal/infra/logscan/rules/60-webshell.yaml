@@ -1,0 +1,343 @@
+# Webshell 上传与访问
+#
+# 四层检测，缺一不可：
+#   1) 内容语义（isWebshellContent）+ 危险函数与超全局变量组合 —— 拦"参数里直接塞一句话木马"；
+#   2) 文件名（FILES）—— 拦"文件名本身就是 webshell"；
+#   3) 文件魔数（FILES_MAGIC，前 16 字节 hex）—— 拦"改了扩展名但内容还是脚本/可执行文件"；
+#   4) 访问路径（REQUEST_PATH）—— 拦"上传之后回来连它"。
+#
+# FILES_MAGIC 规则只看魔数，不看文件名，所以 `logo.jpg` 里塞 `<?php` 一样会中；
+# 反过来，正常 JPEG/PNG/GIF/PDF/ZIP 的魔数一条都不在模式表里。
+# 注意：FILES 集合只装元数据（字段名/文件名/大小/魔数），本轮不落盘、不读整个文件体，
+# 因此"文件内容里的 webshell"只能靠 REQUEST_BODY 那条路径覆盖。
+version: 1
+meta:
+  name: "Webshell 与文件上传"
+  author: "qingli"
+  category: webshell
+
+rules:
+
+  - id: WS-9001
+    phase: 2
+    severity: critical
+    category: webshell
+    score: 5
+    message: "Webshell 特征：恶意脚本内容语义命中（isWebshellContent）"
+    tags: [webshell, rce, owasp-a03, semantic]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: isWebshellContent
+    test:
+      positive:
+        - "<?php @eval($_POST['cmd']); ?>"
+        - "<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>"
+      negative:
+        - "our team uses PHP and MySQL for the backend"
+        - "the functionality of the system is limited"
+        - "please evaluate the offer carefully"
+
+  - id: WS-9002
+    phase: 2
+    severity: critical
+    category: webshell
+    score: 5
+    message: "Webshell 特征：危险函数与超全局变量的组合"
+    tags: [webshell, rce, php, asp, jsp]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "eval($_"
+          - "assert($_"
+          - "system($_"
+          - "shell_exec($_"
+          - "passthru($_"
+          - "popen($_"
+          - "proc_open($_"
+          - "base64_decode($_"
+          - "gzinflate(base64"
+          - "str_rot13("
+          - "create_function("
+          - "$_post["
+          - "$_get["
+          - "$_request["
+          - "$_cookie["
+          - "$_server["
+          - "@eval("
+          - "runtime.getruntime().exec"
+          - "processbuilder("
+          - "class.forname("
+          - "getruntime().exec"
+          - "file_put_contents($_"
+          - "move_uploaded_file($_files"
+          - "c99shell"
+          - "r57shell"
+          - "b374k"
+          - "indoxploit"
+          - "webshell"
+          - "antsword"
+          - "behinder"
+    test:
+      positive:
+        - "<?php @eval($_POST['cmd']); ?>"
+        - "system($_GET['c']);"
+        - "$k=\"base64_decode\";$k($_POST['x']);"
+        - "Runtime.getRuntime().exec(request.getParameter(\"cmd\"))"
+      negative:
+        - "$_POST is a superglobal in PHP"
+        - "please evaluate our proposal carefully"
+        - "the system is under maintenance tonight"
+
+  - id: WS-9003
+    phase: 2
+    severity: medium
+    category: webshell
+    score: 3
+    message: "Webshell 迹象：上传文件名命中已知 webshell 名称"
+    tags: [webshell, upload, filename]
+    targets:
+      - collection: FILES
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "c99.php"
+          - "r57.php"
+          - "b374k.php"
+          - "b374k"
+          - "webshell.php"
+          - "indoxploit.php"
+          - "marijuana.php"
+          - "bypass.php"
+          - "kacak.php"
+          - "sadrazam.php"
+          - "alfa.php"
+          - "wso.php"
+          - "pws.php"
+          - "k1ll.php"
+          - "1337.php"
+          - "x7.php"
+          - "aspxspy"
+          - "jspspy"
+          - "antsword"
+          - "behinder"
+          - "godzilla.php"
+          - "shell.php.jpg"
+    action:
+      type: log
+    test:
+      positive:
+        - "c99.php"
+        - "upload/r57.php"
+        - "antSword.jsp"
+        - "b374k.php"
+      negative:
+        - "report-2024.pdf"
+        - "profile-photo.jpg"
+        - "quarterly-sales.xlsx"
+
+  - id: WS-9004
+    phase: 2
+    severity: critical
+    category: webshell
+    score: 5
+    message: "Webshell 特征：上传文件的魔数是脚本或可执行文件"
+    tags: [webshell, upload, magic-bytes]
+    targets:
+      - collection: FILES_MAGIC
+    # **必须有 hexEncode**：FILES_MAGIC 的值是**原始字节**，而下面的 pm 模式是
+    # 十六进制文本。原先只挂 lowercase，于是这条规则在生产里永不命中
+    # ，
+    # 而自测却"通过" —— 因为测试样本当时写的是十六进制文本，正好等于模式。
+    transforms:
+      - hexEncode
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "3c3f706870" # <?php
+          - "3c3f3d"     # <=
+          - "3c25"       # <%
+          - "7f454c46"   # \x7fELF
+          - "4d5a9000"   # MZ\x90\x00
+          - "cafebabe"   # Java class
+          - "23212f"     # #!/
+          - "cffaedfe"   # Mach-O 64 (LE)
+          - "feedface"   # Mach-O (BE)
+    test:
+      # `FILES_MAGIC` 是**二进制**，而 YAML 的 `\xNN` 转义解析出来是 Unicode 码点
+      # （`\x90` 会变成 UTF-8 两字节 0xC2 0x90），写不出原始字节。
+      # 所以这一类的样本约定用**十六进制**表达，
+      # 自测喂样本时会解码成真实字节 —— 这样"自测通过"才等于"生产里真能命中"。
+      positive:
+        - "3c3f7068702073797374656d28245f4745545b2763275d293b203f3e" # <?php ...
+        - "3c3f3d706870696e666f28293b3f3e"                           # <?=phpinfo();?>
+        - "7f454c46020101000000000000000000"                         # ELF
+        - "4d5a90000300000004000000ffff"                             # MZ
+        - "23212f62696e2f7368"                                       # #!/bin/sh
+      negative:
+        - "ffd8ffe000104a464946000101"     # JPEG
+        - "89504e470d0a1a0a0000000d4948"   # PNG
+        - "47494638396126006400"           # GIF
+        - "255044462d312e340a25e2e3"       # PDF
+        - "504b0304140006000800000021"     # ZIP
+  - id: WS-9005
+    phase: 2
+    severity: high
+    category: webshell
+    score: 5
+    message: "Webshell 特征：访问已知 webshell 文件路径"
+    tags: [webshell, access, known-shell]
+    targets:
+      - collection: REQUEST_PATH
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "/c99."
+          - "/r57."
+          - "/b374k."
+          - "/wso."
+          - "/alfa."
+          - "/indoxploit."
+          - "/marijuana."
+          - "/bypass."
+          - "/webshell."
+          - "/backdoor."
+          - "/kacak."
+          - "/sadrazam."
+          - "/pws."
+          - "/k1ll."
+          - "/1337."
+          - "/x7."
+          - "/aspxspy."
+          - "/jspspy."
+          - "/antsword."
+          - "/behinder."
+          - "/godzilla."
+    test:
+      positive:
+        - "/uploads/c99.php"
+        - "/images/x7.jsp"
+        - "/files/antSword.php"
+      negative:
+        - "/api/v1/orders"
+        - "/uploads/report.pdf"
+        - "/assets/js/app.js"
+
+  - id: UPLOAD-1001
+    phase: 2
+    severity: high
+    category: upload
+    score: 5
+    message: "文件上传特征：危险脚本的复合扩展名"
+    tags: [upload, owasp-a04, double-extension]
+    targets:
+      - collection: FILES
+    transforms:
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '\.(?:php[0-9]?|phtml|phar|pht|asp|aspx|ashx|asmx|jsp|jspx|jspf|cgi|pl|sh|exe|dll|war|jar|shtml)[;]?\.[a-z0-9]{2,6}$|\.(?:jpg|jpeg|png|gif|bmp|webp|svg|txt|pdf|zip|rar|gz|tar|doc|docx|xls|xlsx|mp4|mp3)\.(?:php[0-9]?|phtml|phar|pht|asp|aspx|jsp|jspx|cgi|pl|sh|exe|war)$|\.(?:php[0-9]?|phtml|phar|pht|asp|aspx|ashx|asmx|jsp|jspx|jspf|cgi|pl|htaccess|user\.ini)[\s;]*$'
+    test:
+      positive:
+        - "shell.php.jpg"
+        - "avatar.png.php"
+        - "x.phtml.gif"
+        - "1.asp;.jpg"
+      negative:
+        - "report-2024.pdf"
+        - "profile-photo.jpeg"
+        - "archive.tar.gz"
+        - "quarterly-sales.xlsx"
+
+  # 上面两条要求"危险函数 + 超全局变量"的组合，或者内容够长；
+  # 而 `<?php echo 1;`（13 字节）两者都不满足 —— 实测传上去直接能执行。
+  # 这里补一条：**脚本开标签 + 代码特征**就算，不看长度。
+  # 收紧点：开标签后面必须跟代码词（echo/system/$_…），
+  # 所以 `<?xml version="1.0"?>`、`<?php get_header(); ?>` 这类正常文本不会被误伤。
+  - id: UPLOAD-1003
+    phase: 2
+    severity: critical
+    category: upload
+    score: 5
+    message: "文件上传特征：脚本开标签携带可执行代码（含极短样本）"
+    tags: [upload, webshell, rce, short-payload]
+    targets:
+      - collection: FILES
+      - collection: REQUEST_BODY
+      - collection: ARGS
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '<\?(?:php|=)?\s*(?:echo|print|system|exec|eval|assert|passthru|shell_exec|popen|proc_open|preg_replace|base64_decode|phpinfo|file_put_contents|file_get_contents|include|require|\$_(?:get|post|request|cookie|server)|`)|<%\s*(?:runtime|request|response|eval|exec|system)'
+    test:
+      positive:
+        - "<?php echo 1;"
+        - "<?=`id`;"
+        - "<?php system($_GET['c']); ?>"
+        - "<?=phpinfo();"
+        - "<% Runtime.getRuntime().exec(request.getParameter(\"cmd\")); %>"
+      negative:
+        - "our team uses PHP and MySQL for the backend"
+        - "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        - "<?php get_header(); ?>"
+        - "the functionality of the system is limited"
+
+  - id: UPLOAD-1002
+    phase: 2
+    severity: high
+    category: upload
+    score: 5
+    message: "文件上传特征：文件名含路径回溯序列"
+    tags: [upload, path-traversal, owasp-a01]
+    targets:
+      - collection: FILES
+    transforms:
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "../"
+          - "..\\"
+          - "%2e%2e"
+          - "..%2f"
+          - "..%5c"
+          - "%252e%252e"
+          - "....//"
+    test:
+      positive:
+        - "../../etc/passwd"
+        - "..\\..\\windows\\win.ini"
+        - "%2e%2e%2fconf%2fconfig.php"
+        - "....//shell.php"
+      negative:
+        - "report-2024.pdf"
+        - "C:\\Users\\alice\\photo.jpg"
+        - "folder/subfolder/doc.pdf"

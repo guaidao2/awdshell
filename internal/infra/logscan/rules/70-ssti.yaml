@@ -1,0 +1,93 @@
+version: 1
+meta:
+  name: "SSTI 服务端模板注入"
+  author: "donothack"
+  category: ssti
+
+# 为什么单独一个文件：这是 P6 验收（crackweb 打靶场）暴露出的缺口 ——
+# 原先 59 条规则里**没有 SSTI**，`{{1999*1999}}` 这种表达式注入直接穿过。
+# 单独成文件便于回滚，也便于与别处的规则分开评估。
+#
+# 关于误报（这是本规则最费心的部分）：
+# 网上流传的 `\{\{.*\}\}` 那种写法会打死一切带模板文案的正常请求
+# （页面上写 "Hello {{name}}" 太常见了）。所以这里**不匹配"双花括号"本身**，
+# 只匹配"花括号里在做运算或访问引擎内部对象"的形态：
+#   {{7*7}}            → 算术求值探测，模板注入最经典的特征
+#   ${7*7} / #{7*7}    → JSP EL / Thymeleaf / Ruby 的同类形态
+#   {{config}} {{''.__class__}} → 引擎内部对象访问（沙箱逃逸的起手式）
+#   <% %> / {% if %}   → ERB/JSP 与 Jinja/Twig 的语法标记
+# 普通的 {{name}}、{{ user.name }}、$5、#hashtag 都不会命中。
+
+rules:
+  - id: SSTI-3001
+    phase: 2
+    severity: critical
+    category: ssti
+    score: 5
+    message: "服务端模板注入：表达式在参数里被求值（{{7*7}} / ${7*7} 形态）"
+    tags: [ssti, rce, owasp-a03, injection, template]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+      - collection: REQUEST_HEADERS
+    transforms:
+      - urlDecode
+      - urlDecode
+      - htmlEntityDecode
+      - removeNulls
+    operator:
+      name: anyOf
+      params:
+        operators:
+          # 双花括号里做算术：模板注入最经典、最可靠的指纹
+          - name: regex
+            params:
+              pattern: '\{\{\s*[0-9]{1,12}\s*[*+\-/]\s*[0-9]{1,12}\s*\}\}'
+          # 花括号里出现字符串/字符与运算符的组合，例如 {{'a'*1000}}（DoS 探测）
+          - name: regex
+            params:
+              pattern: '\{\{\s*[''"][^''"]{1,32}[''"]\s*[*+]\s*[0-9]{1,12}\s*\}\}'
+          # JSP EL / Thymeleaf：${7*7}
+          - name: regex
+            params:
+              pattern: '\$\{\s*[0-9]{1,12}\s*[*+\-/]\s*[0-9]{1,12}\s*\}'
+          # Ruby / Thymeleaf 预处理：#{7*7}
+          - name: regex
+            params:
+              pattern: '#\{\s*[0-9]{1,12}\s*[*+\-/]\s*[0-9]{1,12}\s*\}'
+          # 引擎内部对象访问（沙箱逃逸起手式）
+          - name: regex
+            params:
+              pattern: '__(class|mro|subclasses|globals|builtins|getattribute|import)__'
+          # 双花括号里直接访问引擎内置对象
+          - name: regex
+            params:
+              pattern: '\{\{\s*(config|self|request|application|session|cycler|joiner|namespace|lipsum|settings|environ)\b'
+          # Jinja/Twig 语句标记
+          - name: regex
+            params:
+              pattern: '\{%\s*(if|for|set|include|extends|block|import|macro|raw)\b'
+          # ERB / JSP / ASP 输出标记
+          - name: regex
+            params:
+              pattern: '<%[=@]?[\s\S]{0,64}?%>'
+    test:
+      positive:
+        - "{{1999*1999}}"
+        - "{{7*7}}"
+        - "${7*7}"
+        - "#{7*7}"
+        - "{{config}}"
+        - "{{''.__class__}}"
+        - "{% if 1 %}x{% endif %}"
+        - "<%= 7*7 %>"
+        - "search?q=%7B%7B1999*1999%7D%7D"
+      negative:
+        - "{{name}}"
+        - "{{ user.name }}"
+        - "Hello {{world}}, welcome to our site"
+        - "the price is $5 and the code is #hashtag"
+        - "cost: 100 * 2 = 200"
+        - "email me at a@b.com"
+        - "{{ }}"

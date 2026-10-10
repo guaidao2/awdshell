@@ -1,0 +1,121 @@
+version: 1
+meta:
+  name: "访问控制"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+checks:
+
+  - id: CHK-AC-001
+    title: "除 root 外不存在 UID 为 0 的账号"
+    category: 访问控制
+    severity: critical
+    refs: ["等保 8.1.4.2 访问控制", "CIS 6.2.5"]
+    command: "awk -F: '($3==0 && $1!=\"root\"){print $1}' /etc/passwd 2>/dev/null"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "UID 0 等同超级用户。删除或修改这些账号的 UID：usermod -u <新UID> 账号。"
+
+  - id: CHK-AC-002
+    title: "/etc/shadow 权限不超过 640"
+    category: 访问控制
+    severity: high
+    refs: ["等保 8.1.4.2 访问控制", "CIS 6.1.3"]
+    command: "stat -c '%a' /etc/shadow 2>/dev/null"
+    expect:
+      type: regex_match
+      pattern: '^(600|640|000|400)$'
+    remedy: "chmod 640 /etc/shadow && chown root:shadow /etc/shadow"
+
+  - id: CHK-AC-003
+    title: "/etc/passwd 权限正确"
+    category: 访问控制
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制", "CIS 6.1.2"]
+    command: "stat -c '%a' /etc/passwd 2>/dev/null"
+    expect:
+      type: regex_match
+      pattern: '^(644|640|600)$'
+    remedy: "chmod 644 /etc/passwd && chown root:root /etc/passwd"
+
+  - id: CHK-AC-004
+    title: "SSH 配置文件权限不超过 640"
+    category: 访问控制
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制", "CIS 5.1.1"]
+    command: "stat -c '%a' /etc/ssh/sshd_config 2>/dev/null"
+    expect:
+      type: regex_match
+      pattern: '^(600|640)$'
+    remedy: "chmod 600 /etc/ssh/sshd_config && chown root:root /etc/ssh/sshd_config"
+
+  - id: CHK-AC-005
+    title: "sudo 未配置免密执行（NOPASSWD）"
+    category: 访问控制
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制", "CIS 1.3.1"]
+    command: "grep -rhE 'NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -n5"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)nopasswd'
+    remedy: "去掉 sudoers 中的 NOPASSWD 标记，让提权操作需要再次输入口令。"
+    note: "自动化运维场景常有例外，请结合实际情况判断。"
+
+  - id: CHK-AC-006
+    title: "关键目录下不存在全局可写文件"
+    category: 访问控制
+    severity: high
+    refs: ["等保 8.1.4.2 访问控制", "CIS 6.1.10"]
+    command: "find /etc /bin /sbin /usr/bin /usr/sbin -xdev -type f -perm -0002 2>/dev/null | head -n10"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉文件的其他用户写权限：chmod o-w <文件>。全局可写文件可被任意用户篡改。"
+    timeout: 30
+
+  - id: CHK-AC-007
+    title: "root 家目录权限不宽于 750"
+    category: 访问控制
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制", "CIS 6.1.6"]
+    command: "stat -c '%a' /root 2>/dev/null"
+    expect:
+      type: numeric_max
+      value: 750
+    remedy: "chmod 700 /root"
+
+  - id: CHK-AC-008
+    title: "未启用危险的 NFS/RPC 文件共享"
+    category: 访问控制
+    severity: medium
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "cat /etc/exports 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' | head -n5"
+    expect:
+      type: manual
+    remedy: "确认 /etc/exports 中的共享范围与权限是否必要；不必要时停止 nfs-server。"
+    note: "需人工确认共享目录与访问范围是否符合业务需要。"
+
+  - id: CHK-AC-009
+    title: "可登录账号清单（人工确认）"
+    category: 访问控制
+    severity: low
+    refs: ["等保 8.1.4.2 访问控制", "CIS 6.2"]
+    command: "awk -F: '($3>=1000 && $7!~/(nologin|false)$/){print $1\" (uid=\"$3\", shell=\"$7\")\"}' /etc/passwd 2>/dev/null | head -n20"
+    expect:
+      type: manual
+    remedy: "清理不再需要的账号，或把其 shell 改为 /sbin/nologin。"
+    note: "这里列出的是可以登录的普通账号，需要人工确认是否都是必须保留的。"
+
+  - id: CHK-AC-010
+    title: "root 的 SSH 授权密钥受控"
+    category: 访问控制
+    severity: high
+    refs: ["等保 8.1.4.2 访问控制"]
+    command: "if [ -f /root/.ssh/authorized_keys ]; then stat -c '%a' /root/.ssh/authorized_keys; wc -l < /root/.ssh/authorized_keys; else echo 'NO_FILE'; fi 2>/dev/null"
+    expect:
+      type: regex_not_match
+      pattern: '^(6[4-9][0-9]|7[0-9][0-9])$'
+    remedy: "chmod 600 /root/.ssh/authorized_keys，并逐条核对公钥是否都是本人可控的。"
+    note: "输出第一行是权限、第二行是密钥条数。密钥数量多时请逐条确认来源。"

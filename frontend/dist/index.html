@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>awdshell</title>
+    <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
+    <link rel="stylesheet" href="/vendor/codemirror/codemirror.css" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="brand">awdshell <span class="ver" id="version"></span></div>
+          <input id="search" class="search" placeholder="搜索 名称 / 主机 / 标签" />
+          <button id="btn-new" class="primary">新建目标</button>
+        </div>
+        <div class="sidebar-body" id="sidebar-body"></div>
+      </aside>
+
+      <main class="workspace">
+        <div class="tabs">
+          <div class="tabs-list" id="tabs"></div>
+          <div class="tabs-views">
+            <button class="view-btn" id="btn-files" title="在终端右侧显示文件面板">文件面板</button>
+            <button class="view-btn" id="btn-monitor" title="在终端右侧显示资源监控">监控</button>
+            <span class="view-sep"></span>
+            <button class="view-btn grid-btn active" data-grid="1" title="单屏">▣</button>
+            <button class="view-btn grid-btn" data-grid="cols2" title="左右分屏">▥</button>
+            <button class="view-btn grid-btn" data-grid="rows2" title="上下分屏">▤</button>
+            <button class="view-btn grid-btn" data-grid="grid4" title="四格分屏">⊞</button>
+            <button class="view-btn" id="btn-threat" title="汇总所有检测结果，看来源排行与攻击趋势">态势</button>
+            <button class="view-btn" id="btn-logscan" title="检测日志里的攻击载荷与入侵痕迹">日志检测</button>
+            <button class="view-btn" id="btn-compliance" title="按等保 2.0 与 CIS 要求核查主机配置">基线核查</button>
+            <button class="view-btn" id="btn-settings" title="打开设置">设置</button>
+          </div>
+        </div>
+
+        <div class="work-body" id="work-body">
+          <div class="term-area" id="term-area"></div>
+          <div class="panel-resizer" id="files-resizer" title="拖动调整宽度；双击恢复默认宽度" hidden></div>
+          <div class="files-area" id="files-area" hidden></div>
+          <div class="monitor-area" id="monitor-area" hidden></div>
+        </div>
+
+        <div class="settings-area" id="settings-area" hidden></div>
+        <div class="logscan-area" id="logscan-area" hidden></div>
+        <div class="compliance-area" id="compliance-area" hidden></div>
+        <div class="threat-area" id="threat-area" hidden></div>
+
+        <footer class="statusbar">
+          <span class="status-text" id="status">就绪</span>
+          <span class="spacer"></span>
+          <span id="stat-sessions">0 个会话</span>
+          <span id="stat-targets">0 台目标</span>
+        </footer>
+      </main>
+    </div>
+
+    <div class="modal-mask" id="modal" hidden>
+      <div class="modal">
+        <h3 id="modal-title">新建目标</h3>
+        <div class="grid">
+          <label>名称<input id="f-name" placeholder="例如 web-01" /></label>
+          <label>主机<input id="f-host" placeholder="10.0.0.5 或 example.com" /></label>
+          <label>端口<input id="f-port" type="number" value="22" min="1" max="65535" /></label>
+          <label>用户名<input id="f-username" placeholder="root" /></label>
+          <label>
+            认证方式
+            <select id="f-auth">
+              <option value="password">密码</option>
+              <option value="privatekey">私钥</option>
+            </select>
+          </label>
+          <label>分组<input id="f-group" placeholder="可选，例如 生产" /></label>
+          <label>标签<input id="f-tags" placeholder="逗号分隔，例如 生产,web,核心" /></label>
+          <label>初始目录<input id="f-startdir" placeholder="留空 = 家目录；不存在则自动回退" /></label>
+        </div>
+        <label id="wrap-password">
+          密码
+          <input id="f-password" type="password" />
+        </label>
+        <div id="wrap-key" hidden>
+          <label>
+            私钥内容
+            <textarea id="f-privatekey" rows="5" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+          </label>
+          <label>私钥口令<input id="f-passphrase" type="password" /></label>
+        </div>
+        <p class="error" id="form-error"></p>
+        <div class="modal-actions">
+          <button id="btn-cancel">取消</button>
+          <button id="btn-save" class="primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-mask" id="file-modal" hidden>
+      <div class="modal wide">
+        <h3 id="file-modal-title">编辑文件</h3>
+        <div id="file-editor"></div>
+        <p class="error" id="file-error"></p>
+        <div class="modal-actions">
+          <button id="file-cancel">取消</button>
+          <button id="file-save" class="primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/vendor/xterm/xterm.js"></script>
+    <script src="/vendor/xterm/addon-fit.js"></script>
+    <script src="/runtime.js"></script>
+    <script src="/api-token.js"></script>
+    <script src="/vendor/codemirror/codemirror.js"></script>
+    <script src="/vendor/codemirror/addon/matchbrackets.js"></script>
+    <script src="/vendor/codemirror/addon/closebrackets.js"></script>
+    <script src="/vendor/codemirror/addon/active-line.js"></script>
+    <script src="/vendor/codemirror/addon/searchcursor.js"></script>
+    <script src="/vendor/codemirror/addon/search.js"></script>
+    <script src="/views.js"></script>
+    <script src="/targets.js"></script>
+    <script src="/toast.js"></script>
+    <script src="/app.js"></script>
+    <script src="/files.js"></script>
+    <script src="/monitor.js"></script>
+    <script src="/logscan.js"></script>
+    <script src="/compliance.js"></script>
+    <script src="/threat.js"></script>
+    <script src="/settings.js"></script>
+  </body>
+</html>

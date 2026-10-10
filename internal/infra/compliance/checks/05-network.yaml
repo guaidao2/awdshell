@@ -1,0 +1,110 @@
+version: 1
+meta:
+  name: "入侵防范"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+# 等保三级的入侵防范要求：遵循最小安装原则、关闭不需要的服务与端口、
+# 限制终端接入、及时修补漏洞。这一组检查对外暴露面与内核侧的加固参数。
+
+checks:
+
+  - id: CHK-NW-001
+    title: "对外监听端口清单（人工确认最小化）"
+    category: 入侵防范
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "(ss -tulnH 2>/dev/null || netstat -tuln 2>/dev/null) | awk '{print $1, $5}' | grep -vE '127\\.0\\.0\\.1|\\[?::1\\]?|/run/|/var/run/' | sort -u | head -n 25"
+    expect:
+      type: manual
+    remedy: "逐条确认对外监听的端口都是业务所需；不需要的停掉服务并禁止开机自启（systemctl disable --now 服务名），或用防火墙限制来源。"
+    note: "这里只列非本地回环的监听项。绑定 0.0.0.0 与具体外网 IP 都会列出，需要人工核对。"
+
+  - id: CHK-NW-002
+    title: "SSH 未启用不安全的加密算法"
+    category: 入侵防范
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 5.2"]
+    command: "sshd -T 2>/dev/null | grep -iE '^(ciphers|macs|kexalgorithms|hostkeyalgorithms)' | head -n 6"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)(3des|arcfour|blowfish|cast128|hmac-md5|hmac-sha1|diffie-hellman-group1|diffie-hellman-group14-sha1|ssh-dss|ssh-rsa)'
+    remedy: "在 /etc/ssh/sshd_config 中显式指定现代算法组合，例如 Ciphers aes256-gcm@openssh.com,chacha20-poly1305@openssh.com、MACs hmac-sha2-512-etm@openssh.com、KexAlgorithms curve25519-sha256。"
+    note: "ssh-rsa 作为主机密钥算法已被认为不安全，建议改用 ed25519 或 rsa-sha2。"
+
+  - id: CHK-NW-003
+    title: "SSH 未允许协议版本 1"
+    category: 入侵防范
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "grep -iE '^[[:space:]]*Protocol[[:space:]]' /etc/ssh/sshd_config 2>/dev/null | head -n 3; grep -qiE '^[[:space:]]*Protocol[[:space:]]' /etc/ssh/sshd_config 2>/dev/null || echo NO_PROTOCOL_DIRECTIVE"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)protocol[[:space:]]+1'
+    remedy: "SSH 协议 1 存在已知设计缺陷，确保 sshd_config 中没有 Protocol 1（新版 OpenSSH 已移除该选项，默认只用协议 2）。"
+
+  - id: CHK-NW-004
+    title: "SSH 认证尝试次数与空闲超时受控"
+    category: 入侵防范
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 5.2"]
+    command: "sshd -T 2>/dev/null | grep -iE '^(maxauthtries|logingracetime|clientaliveinterval|clientalivecountmax)' | head -n 5"
+    expect:
+      type: manual
+    remedy: "建议 MaxAuthTries 4 以内、LoginGraceTime 60 以内，并设置 ClientAliveInterval 300 与 ClientAliveCountMax 2 让空闲会话自动断开。"
+
+  - id: CHK-NW-005
+    title: "未运行明文或历史遗留的网络服务"
+    category: 入侵防范
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "systemctl list-units --type=service --state=running 2>/dev/null | grep -E '(telnet|rlogin|rsh|rexec|tftp|finger|xinetd|nis|ypbind)' | head -n 10; (ss -tulnH 2>/dev/null | grep -E ':(23|21|69|79|111)\\b') | head -n 5"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "停用并卸载这些服务。telnet/rlogin/rsh 传输明文口令，tftp 无认证，在等保测评中属于明确的整改项。"
+
+  - id: CHK-NW-006
+    title: "已开启 SYN Flood 防护"
+    category: 入侵防范
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 3.1"]
+    command: "sysctl -n net.ipv4.tcp_syncookies 2>/dev/null"
+    expect:
+      type: regex_match
+      pattern: '^1$'
+    remedy: "在 /etc/sysctl.d/ 下设置 net.ipv4.tcp_syncookies = 1 并执行 sysctl --system。"
+
+  - id: CHK-NW-007
+    title: "已关闭 ICMP 重定向与源路由"
+    category: 入侵防范
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 3.2"]
+    command: "for k in net.ipv4.conf.all.accept_redirects net.ipv4.conf.all.send_redirects net.ipv4.conf.all.accept_source_route net.ipv4.conf.default.accept_redirects net.ipv4.conf.default.accept_source_route; do printf '%s=%s\\n' \"$k\" \"$(sysctl -n $k 2>/dev/null)\"; done"
+    expect:
+      type: regex_not_match
+      pattern: '=1$'
+    remedy: "在 /etc/sysctl.d/ 下把这几个参数都设为 0 并执行 sysctl --system。接受 ICMP 重定向可被用于中间人路由劫持。"
+
+  - id: CHK-NW-008
+    title: "已开启地址空间随机化（ASLR）"
+    category: 入侵防范
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范", "CIS 1.5"]
+    command: "sysctl -n kernel.randomize_va_space 2>/dev/null"
+    expect:
+      type: regex_match
+      pattern: '^2$'
+    remedy: "设置 kernel.randomize_va_space = 2。关闭或减弱 ASLR 会显著降低内存破坏类漏洞的利用门槛。"
+
+  - id: CHK-NW-009
+    title: "SUID 程序的核心转储已禁止"
+    category: 入侵防范
+    severity: low
+    refs: ["CIS 1.5"]
+    command: "sysctl -n fs.suid_dumpable 2>/dev/null"
+    expect:
+      type: regex_match
+      pattern: '^0$'
+    remedy: "设置 fs.suid_dumpable = 0，避免特权程序崩溃时把内存内容（可能含凭据）落到磁盘。"

@@ -1,0 +1,117 @@
+version: 1
+meta:
+  name: "SUID / SGID 权限提升风险"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+# 为什么单独一组：带 SUID 位的可执行文件以属主（通常是 root）权限运行，
+# 一旦这个程序本身能被用来执行任意命令或读写任意文件，任何本地用户都能借此提权。
+# 这里按 GTFOBins 公开整理的提权技术，把危险程序分成三类分别检查：
+#   - 解释器与脚本引擎：直接就能拿到 root shell
+#   - 文件读写与归档：可以读 /etc/shadow 或往任意路径写文件
+#   - 系统工具：mount / docker / pkexec 这类，提权路径更间接但一样有效
+# 核查只做检测与说明，不执行任何利用动作。
+#
+# 性能注意：find 只在 SUID 真正会出现的目录里找，不做全盘遍历 ——
+# 全盘 find 在这类机器上要十几秒，几条检查叠起来就是一分多钟，没法用。
+# SUIDDIRS 覆盖了发行版放系统程序的目录，也覆盖了后门喜欢藏身的临时目录与用户目录。
+
+checks:
+
+  - id: CHK-SUID-001
+    title: "SUID 文件清单（人工确认基线）"
+    category: 提权风险
+    severity: low
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/local /opt /srv /home /tmp /var/tmp /dev/shm -xdev -type f -perm -4000 -printf '%M %u %p\\n' 2>/dev/null | sort | head -n 60"
+    expect:
+      type: manual
+    remedy: "对照清单确认每个 SUID 程序都是必须的；不需要的去掉 SUID 位：chmod u-s <文件>。"
+    note: "输出格式为 权限 属主 路径。系统自带的核心工具（passwd、sudo、mount）通常是正常的，重点看多出来的。"
+    timeout: 20
+
+  - id: CHK-SUID-002
+    title: "无可获取 root shell 的 SUID 解释器"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.4 入侵防范", "GTFOBins: shell"]
+    command: "find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/local /opt /srv /home /tmp /var/tmp /dev/shm -xdev -type f -perm -4000 2>/dev/null | grep -E '/(find|vim|vi|view|nano|less|more|man|awk|gawk|mawk|sed|perl|ruby|python|python2|python3|php|lua|node|gcc|cc|make|env|nice|stdbuf|time|timeout|watch|expect|screen|tmux|script|bash|sh|dash|zsh|ksh|csh|ash|busybox|ed|ex)$' | head -n 20"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉 SUID 位：chmod u-s <文件>。解释器带 SUID 等于给任何本地用户一个 root shell，这是最危险的一类。"
+    timeout: 20
+
+  - id: CHK-SUID-003
+    title: "无可读任意文件的 SUID 程序"
+    category: 提权风险
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范", "GTFOBins: read"]
+    command: "find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/local /opt /srv /home /tmp /var/tmp /dev/shm -xdev -type f -perm -4000 2>/dev/null | grep -E '/(cat|head|tail|sort|uniq|strings|base64|xxd|od|dd|tee|cp|mv|rm|tar|zip|gzip|bzip2|xz|cpio|rsync|diff|cmp|nl|tac|rev|split|csplit|column|expand|fold|paste|join|comm|openssl|gpg|sqlite3|lesspipe)$' | head -n 20"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉 SUID 位：chmod u-s <文件>。这类程序能以 root 身份读取任意文件（例如 /etc/shadow），或向任意路径写入内容。"
+    timeout: 20
+
+  - id: CHK-SUID-004
+    title: "无不该带 SUID 的高风险工具"
+    category: 提权风险
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范", "GTFOBins: file"]
+    command: "find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/local /opt /srv /home /tmp /var/tmp /dev/shm -xdev -type f -perm -4000 2>/dev/null | grep -E '/(docker|podman|systemctl|journalctl|nmap|strace|ltrace|gdb|git|hg|svn|apt|apt-get|yum|dnf|pip|npm|snap|capsh|unshare|nsenter|fuse|fusermount|mount\\.cifs|mount\\.nfs|setfacl|xargs|install|at|batch|crontab|expiry|chattr)$' | head -n 20"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "逐项确认是否必须带 SUID，多数情况应 chmod u-s。"
+    note: "mount、umount、chsh、newgrp、passwd、su、sudo、pkexec 这些是发行版本来就设计成带 SUID 的，不在这条清单里；这里只列不该带 SUID 的工具。pkexec 的版本问题单独由 CHK-SUID-007 检查。"
+    timeout: 20
+
+  - id: CHK-SUID-005
+    title: "SUID 文件不在临时目录或用户目录"
+    category: 提权风险
+    severity: critical
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "find /tmp /var/tmp /dev/shm /home /opt /srv /usr/local -xdev -type f -perm -4000 2>/dev/null | head -n 20"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "立刻隔离并分析这些文件：正常软件不会把 SUID 程序放在临时目录或用户目录，这通常是后门或提权木马。"
+    note: "这一项几乎没有误报空间，命中即需要人工介入。"
+    timeout: 20
+
+  - id: CHK-SUID-006
+    title: "不存在 SGID 的危险程序"
+    category: 提权风险
+    severity: medium
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/local /opt /home /tmp -xdev -type f -perm -2000 2>/dev/null | grep -E '/(bash|sh|dash|zsh|perl|python|python3|ruby|php|find|vim|nano|less|more|awk|sed|tar|cp|mv|cat|dd|xargs|screen|tmux)$' | head -n 20"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "去掉 SGID 位：chmod g-s <文件>。SGID 会以属组权限运行，若属组是高权限组同样可用于提权。"
+    timeout: 20
+
+  - id: CHK-SUID-007
+    title: "pkexec 未受 PwnKit 漏洞影响"
+    category: 提权风险
+    severity: critical
+    refs: ["CVE-2021-4034", "等保 8.1.4.4 入侵防范"]
+    command: "if command -v pkexec >/dev/null 2>&1; then pkexec --version 2>&1 | head -n1; rpm -q polkit 2>/dev/null | head -n1; dpkg-query -W -f='${Version}' policykit-1 2>/dev/null || dpkg-query -W -f='${Version}' pkexec 2>/dev/null; else echo NOT_INSTALLED; fi"
+    expect:
+      type: manual
+    remedy: "CVE-2021-4034（PwnKit）影响 polkit 0.105 至 0.120 的旧版本号方案：任何本地用户可直接提权到 root。升级 polkit 到修复版本（如 0.105-31+deb11u1、0.120-3.el8），或临时 chmod u-s /usr/bin/pkexec。"
+    note: "注意版本号有两种方案：老发行版是 0.105~0.120（受影响区间），较新的发行版直接跳到 121 以上（如 Kali 显示 127，不受影响）。已打补丁的版本会带后缀（+deb11u1、.el8 等）。"
+
+  - id: CHK-SUID-008
+    title: "最近 30 天内新增的 SUID 文件"
+    category: 提权风险
+    severity: high
+    refs: ["等保 8.1.4.4 入侵防范"]
+    command: "find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/libexec /usr/local /opt /home /tmp /var/tmp /dev/shm -xdev -type f -perm -4000 -mtime -30 2>/dev/null | head -n 20"
+    expect:
+      type: manual
+    remedy: "确认这些文件的来源与用途；非软件包管理器安装的 SUID 程序需要重点排查。"
+    note: "刚打完补丁或装完软件时会有正常新增，需结合时间点判断。"
+    timeout: 20

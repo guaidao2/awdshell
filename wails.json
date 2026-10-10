@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "awdshell",
+  "outputfilename": "awdshell",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "guaidao2",
+    "email": "3914453474@qq.com"
+  },
+  "info": {
+    "companyName": "awdshell",
+    "productName": "awdshell",
+    "productVersion": "0.1.0",
+    "copyright": "MIT License",
+    "comments": "面向安全运维与攻防演练的图形化终端工作台"
+  }
+}

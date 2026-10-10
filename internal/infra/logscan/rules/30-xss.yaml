@@ -1,0 +1,520 @@
+# 跨站脚本（XSS）
+#
+# 变换链：urlDecode ×2 → htmlEntityDecode → jsDecode → compressWhitespace → lowercase
+#   htmlEntityDecode 与 jsDecode 让 &lt;script&gt; / \u003cscript\u003e 这类
+#   "先编码再入库"的载荷也露出原形 —— 代价是富文本编辑器提交 `&lt;script&gt;`
+#   代码示例时也会命中，这属于已知取舍，靠 90-exceptions.yaml 的白名单放行（本轮未提供）。
+#   lowercase 必须在链尾：htmlEntityDecode 依赖 &#x3C; / &#60; 的原始大小写形态。
+#
+# 误报控制：不是"有尖括号就报"，而是要求危险标签、事件处理器 + 危险 sink、
+# 或伪协议 + 危险函数。`<p>`/`<b>`/`<div>` 这类正常富文本一律不命中。
+version: 1
+meta:
+  name: "跨站脚本"
+  author: "qingli"
+  category: xss
+
+rules:
+
+  - id: XSS-5001
+    phase: 2
+    severity: high
+    category: xss
+    score: 5
+    message: "XSS 特征：script 标签注入"
+    tags: [xss, owasp-a03, script-tag]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "<script"
+          - "</script"
+    test:
+      positive:
+        - "<script>alert(1)</script>"
+        - "<svg><script>alert(document.cookie)</script></svg>"
+        - "%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+        - "&lt;script&gt;alert(1)&lt;/script&gt;"
+        - "\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"
+      negative:
+        - "<p>Use the <b>bold</b> tag for emphasis</p>"
+        - "Compare: 5 < 10 and 10 > 5"
+        - "The scripting language of the page is ECMAScript"
+        - "<div class=\"card\"><span>Order 42</span></div>"
+
+  - id: XSS-5002
+    phase: 2
+    severity: high
+    category: xss
+    score: 5
+    message: "XSS 特征：标签内事件处理器"
+    tags: [xss, owasp-a03, event-handler]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '<\s*[a-z][a-z0-9]{0,12}\b[^>]{0,160}\bon[a-z]{3,20}\s*='
+    test:
+      positive:
+        - "<img src=x onerror=alert(1)>"
+        - "<svg/onload=alert(1)>"
+        - "<body onload=\"x()\">"
+        - "%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E"
+      negative:
+        - "<a href=\"/about\">About us</a>"
+        - "<img src=\"/logo.png\" alt=\"Company logo\">"
+        - "<table><tr><td>content</td></tr></table>"
+        - "<span class=\"badge\">New</span>"
+
+  - id: XSS-5003
+    phase: 2
+    severity: high
+    category: xss
+    score: 4
+    message: "XSS 特征：javascript/vbscript/data 伪协议"
+    tags: [xss, owasp-a03, pseudo-protocol]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "javascript:alert"
+          - "javascript: alert"
+          - "javascript:eval"
+          - "javascript: eval"
+          - "javascript:confirm"
+          - "javascript: confirm"
+          - "javascript:prompt"
+          - "javascript: document"
+          - "javascript:document"
+          - "javascript:window"
+          - "javascript:location"
+          - "javascript:fetch"
+          - "javascript:xmlhttprequest"
+          - "javascript:new "
+          - "javascript:function"
+          - "javascript:settimeout"
+          - "javascript:setinterval"
+          - "javascript:import("
+          - "javascript:/*"
+          - "vbscript:"
+          - "livescript:"
+          - "data:text/html"
+          - "data:text/javascript"
+          - "data:application/xhtml"
+    test:
+      positive:
+        - "<a href=\"javascript:alert(1)\">click</a>"
+        - "jAvAsCrIpT:eval('1')"
+        - "<iframe src=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>"
+        - "vbscript:document.write(1)"
+      negative:
+        - "<a href=\"javascript:void(0)\">menu</a>"
+        - "Read 'JavaScript: The Good Parts'"
+        - "The data:text/plain format is a standard media type"
+        - "<a href=\"/docs/getting-started\">Docs</a>"
+
+  - id: XSS-5004
+    phase: 2
+    severity: medium
+    category: xss
+    score: 4
+    message: "XSS 特征：嵌入式对象与框架标签"
+    tags: [xss, owasp-a03, embedded-object]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "<iframe"
+          - "<object "
+          - "<embed "
+          - "<applet"
+          - "<meta http-equiv"
+          - "srcdoc="
+          - "formaction="
+          - "xlink:href="
+          - "<base href"
+          - "<marquee"
+          - "<details open"
+    test:
+      positive:
+        - "<iframe src=\"//evil.example/x\"></iframe>"
+        - "<object data=\"//evil.example/y\"></object>"
+        - "<details open ontoggle=alert(1)>"
+        - "<base href=\"//evil.example/\">"
+      negative:
+        - "<p>Embedded content is not allowed in this field</p>"
+        - "<div class=\"card\"><span>Order 42</span></div>"
+        - "<a href=\"/about\">About us</a>"
+
+  - id: XSS-5005
+    phase: 2
+    severity: high
+    category: xss
+    score: 4
+    message: "XSS 特征：属性上下文中的事件处理器"
+    tags: [xss, owasp-a03, attribute-injection]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "onerror=alert"
+          - "onerror=eval"
+          - "onerror=confirm"
+          - "onerror=prompt"
+          - "onerror=document"
+          - "onerror=\""
+          - "onerror='"
+          - "onload=alert"
+          - "onload=eval"
+          - "onload=confirm"
+          - "onload=prompt"
+          - "onload=document"
+          - "onload=\""
+          - "onload='"
+          - "onclick=alert"
+          - "onclick=eval"
+          - "onclick=confirm"
+          - "onclick=prompt"
+          - "onclick=document"
+          - "onclick=\""
+          - "onclick='"
+          - "onfocus=alert"
+          - "onfocus=eval"
+          - "onfocus=confirm"
+          - "onfocus=prompt"
+          - "onfocus=document"
+          - "onfocus=\""
+          - "onfocus='"
+          - "onmouseover=alert"
+          - "onmouseover=eval"
+          - "onmouseover=confirm"
+          - "onmouseover=prompt"
+          - "onmouseover=document"
+          - "onmouseover=\""
+          - "onmouseover='"
+          - "onsubmit=alert"
+          - "onsubmit=eval"
+          - "onsubmit=confirm"
+          - "onsubmit=prompt"
+          - "onsubmit=document"
+          - "onsubmit=\""
+          - "onsubmit='"
+          - "ontoggle=alert"
+          - "ontoggle=eval"
+          - "ontoggle=confirm"
+          - "ontoggle=prompt"
+          - "ontoggle=document"
+          - "ontoggle=\""
+          - "ontoggle='"
+          - "onanimationstart=alert"
+          - "onanimationstart=eval"
+          - "onanimationstart=confirm"
+          - "onanimationstart=prompt"
+          - "onanimationstart=document"
+          - "onanimationstart=\""
+          - "onanimationstart='"
+    test:
+      positive:
+        - "onerror=alert(1)"
+        - "\" onmouseover=\"alert(1)"
+        - "x\"onfocus=confirm(1)"
+        - "onload=eval('1')"
+      negative:
+        - "the onerror handler is documented in the manual"
+        - "Set the onclick property in JavaScript"
+        - "click = 3 items selected"
+        - "the load time is 120 ms"
+
+  - id: XSS-5006
+    phase: 2
+    severity: low
+    category: xss
+    score: 3
+    message: "XSS 迹象：DOM 危险 sink 出现"
+    tags: [xss, owasp-a03, dom-sink]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "document.cookie"
+          - "document.write"
+          - "document.domain"
+          - "document.location"
+          - "document.createelement"
+          - "window.location="
+          - "eval("
+          - "string.fromcharcode"
+          - "atob("
+          - "unescape("
+          - "new function("
+          - "onreadystatechange"
+          - "innerhtml="
+          - "outerhtml="
+          - "insertadjacenthtml"
+    action:
+      type: log
+    test:
+      positive:
+        - "document.cookie"
+        - "eval(atob('YWxlcnQoMSk='))"
+        - "document.write('<img src=x>')"
+        - "el.innerHTML=location.hash"
+      negative:
+        - "The cookie policy document describes how we use cookies"
+        - "we will evaluate your request within two business days"
+        - "The inner HTML of the page is generated on the server"
+
+  - id: XSS-5007
+    phase: 2
+    severity: high
+    category: xss
+    score: 5
+    message: "XSS 特征：语义指纹命中（detectXSS）"
+    tags: [xss, owasp-a03, semantic]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: detectXSS
+      # 没有参数：detectXSS 的判据是固定形态（`<script`、`javascript:`、
+      # `data:text/html`、事件处理器 + 标签上下文、DOM sink），
+      # 调不了阈值。原先这里写着 min_fingerprint_len: 8 —— 那个参数**不生效**，
+      # 现在加载器会直接拒绝它（免得看着像调过关了）。
+    test:
+      positive:
+        - "<img src=x onerror=alert(1)>"
+        - "javascript:alert(1)"
+      negative:
+        - "<p>Hello <b>world</b></p>"
+        - "a < b and c > d"
+        - "5 > 3, so the discount applies"
+
+  - id: XSS-5008
+    phase: 2
+    severity: low
+    category: xss
+    score: 3
+    message: "XSS 迹象：CSS 表达式与样式注入"
+    tags: [xss, css-injection, legacy]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "expression("
+          - "expression ("
+          - "-moz-binding"
+          - "behavior:url"
+          - "behavior: url"
+          - "@import url"
+          - "@import \""
+          - "@import '"
+    action:
+      type: log
+    test:
+      positive:
+        - "<div style=\"width:expression(alert(1))\">"
+        - "-moz-binding:url(//evil.example/x.xml)"
+        - "@import url(//evil.example/x.css)"
+      negative:
+        - "the expression of interest was approved"
+        - "behavior: click the button to continue"
+        - "The import of goods requires a customs declaration"
+
+  # 原型链污染：请求里出现 `__proto__` / `constructor.prototype` 这类键，
+  # 只有在"应用把参数合并进对象"时才可能被利用 —— 正常业务里几乎不出现，
+  # 但代码分享、调试类表单可能贴 JS 源码，所以给 4 分（记分叠加），不单独拦。
+  - id: XSS-5009
+    phase: 2
+    severity: high
+    category: xss
+    score: 4
+    message: "原型链污染特征：请求携带 __proto__ / constructor.prototype"
+    tags: [prototype-pollution, xss, owasp-a03]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "__proto__"
+          - "constructor.prototype"
+          - "constructor[prototype]"
+          - "prototype[__proto__]"
+          - "__definegetter__"
+          - "__lookupgetter__"
+    test:
+      positive:
+        - "__proto__[isAdmin]=true"
+        - "{\"__proto__\":{\"polluted\":1}}"
+        - "constructor.prototype.polluted=1"
+      negative:
+        - "the prototype design is ready for review"
+        - "our constructor won the contract"
+        - "the property listing was updated"
+
+  - id: XSS-5010
+    phase: 2
+    severity: high
+    category: xss
+    score: 5
+    message: "XSS 特征：标签内任意事件处理器属性（形状判定，不枚举处理器名）"
+    tags: [xss, owasp-a03, event-handler]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "<[a-z][a-z0-9]*[^>]{0,200}\\son[a-z]{3,40}\\s*="
+    test:
+      positive:
+        - "<img src=x onerror=alert(1)>"
+        - "<svg onload=alert(1)>"
+        - "<div style=\"content-visibility:auto\" oncontentvisibilityautostatechange=alert(1)>"
+        - "<body onpageshow=alert(1)>"
+      negative:
+        - "<p>The button turns on when pressed</p>"
+        - "status: on = enabled"
+        - "<a href=\"/on=1\">x</a>"
+        - "<div class=\"card\"><span>Order 42</span></div>"
+
+  - id: XSS-5011
+    phase: 2
+    severity: high
+    category: xss
+    score: 5
+    message: "XSS 特征：伪协议内夹控制字符（浏览器会剥掉后还原为 javascript:）"
+    tags: [xss, owasp-a03, pseudo-protocol]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - urlDecodeUni
+      - htmlEntityDecode
+      - jsDecode
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "[\"'(=/]java[\\x00-\\x20]{0,8}script\\s*:"
+    test:
+      positive:
+        - "<a href=\"java&#9;script:alert(1)\">x</a>"
+        - "\"java&#10;script:alert(1)\""
+        - "<img src=\"java&#13;script:alert(1)\">"
+      negative:
+        - "javascript is a programming language"
+        - "use java script: see the docs"
+        - "<a href=\"/docs/javascript\">js docs</a>"

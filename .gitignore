@@ -1,0 +1,47 @@
+# ---- 设计文档与内部资料：不随发布追踪（对外只留根目录 README）----
+docs/
+
+# ---- 构建产物 ----
+build/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+awdshell
+awdshell-cli
+awdshell-rulec
+
+# ---- Go ----
+*.test
+*.out
+coverage.txt
+/vendor/
+
+# ---- Node（当前前端为免构建静态资源，保留此规则以备将来引入构建链）----
+node_modules/
+frontend/node_modules/
+frontend/wailsjs/
+.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+
+# ---- 本地运行数据（真实数据在 %APPDATA%\awdshell）----
+.tmp/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.cast
+records/
+config.local.yaml
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

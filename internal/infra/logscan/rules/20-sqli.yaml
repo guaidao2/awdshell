@@ -1,0 +1,555 @@
+# SQL 注入
+#
+# 变换链说明（顺序即语义，别调换）：
+#   urlDecode, urlDecode   —— crackweb 一类扫描器会先结构改写再套一层编码，
+#                             所以解码要在"去注释/压缩空白"之前（%2f%2a%2a%2f → /**/）。
+#   sqlHexDecode           —— 只在 UNION 规则里挂，解 0x756e696f6e / X'4142' 这类十六进制体。
+#   replaceComments        —— 不是 removeComments：/**/ 必须变成"一个空格"，
+#                             union/**/select 才不会粘成 unionselect（规格里 removeComments
+#                             到底是删除还是替换为空格没有写死，这里按替换语义选题）。
+#   compressWhitespace     —— 空格/制表/换行归一，防止 "union%09select" 绕过。
+#   lowercase              —— 必须在链尾，否则会破坏大小写敏感的字面量匹配。
+#
+# 分数策略：能单独定性的给 5（达阈值即拦），只是"弱信号"的给 3 且 action: log。
+# 全部规则都带正负样本，负样本里刻意包含带单引号的正常英文、以及 union/select 作普通词。
+version: 1
+meta:
+  name: "SQL 注入"
+  author: "qingli"
+  category: sqli
+
+rules:
+
+  - id: SQLI-4001
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：UNION SELECT 联合查询"
+    tags: [sqli, owasp-a03, union-select]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - sqlHexDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: 'union\b(?:\s+(?:all|distinct)\b)?[^a-z0-9]{0,8}\bselect\b'
+    test:
+      positive:
+        - "1' UNION SELECT 1,2,3--"
+        - "admin'/**/UNION/**/SELECT/**/password/**/FROM/**/users"
+        - "1%27%20union%20all%20select%201"
+        - "1 UNION(SELECT 1,2,3)"
+      negative:
+        - "select your country from the list"
+        - "union square station"
+        - "We visited the European Union in 2019 and selected a hotel"
+        - "Select all items in the list"
+
+  # 关键字混淆：CTF 里最常见的两种写法 —— 用 `CHAR(...)` 拼字符串、
+  # 用 `0x...` 十六进制字面量代替关键字。纯字面量规则认不出，
+  # 但它们**必须带 SQL 关键字才有意义**，所以判据是"混淆手法 + 关键字"同时出现，
+  # 正常业务里不会这么写（实测这两种形态此前 0 分漏过）。
+  - id: SQLI-4013
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：关键字混淆（CHAR() 拼接 / 十六进制字面量）"
+    tags: [sqli, owasp-a03, obfuscation]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: 'char\s*\(\s*\d{1,3}(\s*,\s*\d{1,3}){2,}\s*\)\s*(?:union|select|from|where|and|or)\b|(?:union|select|from|where)\s+char\s*\(\s*\d{1,3}(\s*,\s*\d{1,3}){2,}\s*\)|0x[0-9a-f]{8,}\s*(?:union|select|from|where)\b|(?:union|select|from)\s+0x[0-9a-f]{4,}\b'
+    test:
+      positive:
+        - "1 UNION SELECT CHAR(117,110,105,111,110)"
+        - "id=CHAR(117,110,105,111,110) SELECT 1"
+        - "id=0x554e494f4e SELECT 1"
+        - "1 UNION SELECT 0x61646d696e"
+      negative:
+        - "the char(65,66,67) example is in the API docs"
+        - "color in hex is 0xff00ff"
+        - "select the option from the list"
+
+  - id: SQLI-4002
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：引号闭合后的布尔恒等式"
+    tags: [sqli, owasp-a03, boolean-based]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "['\")\\]]\\s*(?:or|and)\\s+(?:\\d{1,12}\\s*(?:=|>|<|like|between)|['\"][a-z0-9]{1,12}['\"]\\s*(?:=|like))"
+    test:
+      positive:
+        - "1' OR 1=1--"
+        - "admin' AND '1'='1"
+        - "1') or 1=1#"
+        - "x\" or \"a\"=\"a"
+      negative:
+        - "choose 'cat' or 'dog' for your pet"
+        - "It's a boy or a girl"
+        - "the total is 3 or 4 items"
+        - "He said 'come' and 'go' in the same sentence"
+
+  - id: SQLI-4003
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：时间盲注函数"
+    tags: [sqli, owasp-a03, time-based]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "sleep("
+          - "sleep ("
+          - "pg_sleep("
+          - "pg_sleep ("
+          - "benchmark("
+          - "waitfor delay"
+          - "dbms_pipe.receive_message"
+          - "dbms_lock.sleep"
+          - "utl_inaddr.get_host_address"
+    test:
+      positive:
+        - "1' AND SLEEP(5)--"
+        - "1'); SELECT pg_sleep(5)--"
+        - "1 WAITFOR DELAY '0:0:5'"
+        - "1' AND (SELECT 1 FROM (SELECT SLEEP(5))x)--"
+      negative:
+        - "how to sleep better at night"
+        - "the sleep quality report for last quarter"
+        - "please wait for the delay to clear"
+
+  - id: SQLI-4004
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：系统表查询与文件读写"
+    tags: [sqli, owasp-a03, metadata, file-write]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "information_schema"
+          - "mysql.user"
+          - "mysql.func"
+          - "sys.objects"
+          - "sysobjects"
+          - "syscolumns"
+          - "pg_catalog"
+          - "pg_class"
+          - "all_tables"
+          - "sqlite_master"
+          - "sqlite_temp_master"
+          - "dba_users"
+          - "v$version"
+          - "xp_cmdshell"
+          - "sp_executesql"
+          - "sp_oacreate"
+          - "load_file("
+          - "into outfile"
+          - "into dumpfile"
+          - "load data infile"
+          - "utl_file"
+          - "openrowset"
+          - "opendatasource"
+          - "copy (select"
+          - "copy(select"
+    test:
+      positive:
+        - "1' UNION SELECT table_name,2 FROM information_schema.tables--"
+        - "1'; SELECT load_file('/etc/passwd')--"
+        - "1' AND 1=1 INTO OUTFILE '/var/www/shell.php'--"
+        - "';exec xp_cmdshell 'whoami'--"
+      negative:
+        - "the database schema is described in the wiki"
+        - "select your plan from the list below"
+        - "Load the profile page to continue"
+
+  - id: SQLI-4005
+    phase: 2
+    severity: medium
+    category: sqli
+    score: 3
+    message: "SQL 注入迹象：引号后紧跟注释截断符"
+    tags: [sqli, owasp-a03, comment-truncation]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "'--"
+          - "';--"
+          - "')--"
+          - "');--"
+          - "\"--"
+          - "\";--"
+          - "\")--"
+          - "'--+"
+          - "\"--+"
+          - "')#"
+          - "'#"
+          - "\"#"
+    action:
+      type: log
+    test:
+      positive:
+        - "1'--"
+        - "admin');--"
+        - "1\"--"
+        - "%271%27--"
+      negative:
+        - "chapter 3' -- notes from the author"
+        - "order #1234 has been shipped"
+        - "C++ -- a language note"
+
+  - id: SQLI-4006
+    phase: 2
+    severity: high
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：报错回显型函数"
+    tags: [sqli, owasp-a03, error-based]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "extractvalue("
+          - "updatexml("
+          - "floor(rand"
+          - "exp(~("
+          - "name_const("
+          - "gtid_subset("
+    test:
+      positive:
+        - "1' AND extractvalue(1,concat(0x7e,version()))--"
+        - "1' AND updatexml(1,concat(0x7e,(SELECT user())),1)--"
+        - "1' AND (SELECT COUNT(*),CONCAT(version(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a--"
+      negative:
+        - "please extract value from the report"
+        - "the exported value is 42"
+        - "Update XML documents with the editor"
+
+  - id: SQLI-4007
+    phase: 2
+    severity: medium
+    category: sqli
+    score: 3
+    message: "SQL 注入迹象：SQL 关键字后紧跟十六进制字面量"
+    tags: [sqli, owasp-a03, hex-encoding]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "union 0x"
+          - "select 0x"
+          - "from 0x"
+          - "where 0x"
+          - "having 0x"
+          - "insert 0x"
+          - "values 0x"
+          - "into 0x"
+          - "concat 0x"
+          - "unhex 0x"
+    action:
+      type: log
+    test:
+      positive:
+        - "1 UNION SELECT 0x4141414141414141--"
+        - "1' AND (SELECT 0x6d7973716c)--"
+        - "1 having 0x4142434445464748"
+      negative:
+        - "the token is 0x7f3a9c2b1d4e5f60a1b2c3d4"
+        - "order 0x1234567890ab has shipped"
+        - "Please convert 0x2a to decimal"
+
+  - id: SQLI-4008
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "NoSQL 注入特征：查询操作符注入"
+    tags: [sqli, nosql, owasp-a03]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "\"$ne\""
+          - "[$ne]"
+          - "$ne="
+          - "\"$gt\""
+          - "[$gt]"
+          - "$gt="
+          - "\"$gte\""
+          - "[$gte]"
+          - "$gte="
+          - "\"$lt\""
+          - "[$lt]"
+          - "$lt="
+          - "\"$lte\""
+          - "[$lte]"
+          - "$lte="
+          - "\"$regex\""
+          - "[$regex]"
+          - "$regex="
+          - "\"$where\""
+          - "[$where]"
+          - "$where="
+          - "\"$exists\""
+          - "[$exists]"
+          - "$exists="
+          - "\"$nin\""
+          - "[$nin]"
+          - "$nin="
+          - "\"$expr\""
+          - "[$expr]"
+          - "$expr="
+          - "\"$elemmatch\""
+          - "[$elemmatch]"
+          - "$elemmatch="
+          - "\"$jsonschema\""
+          - "[$jsonschema]"
+          - "$jsonschema="
+    test:
+      positive:
+        - '{"username":{"$ne":null}}'
+        - "user[$ne]=admin"
+        - '{"$where":"1==1"}'
+        - 'q={"$regex":"^a"}'
+      negative:
+        - "the price is $5 for 2 items"
+        - "cost $next month is unknown"
+        - "$nested flag is enabled"
+
+  - id: SQLI-4009
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：语义指纹命中（detectSQLi）"
+    tags: [sqli, owasp-a03, semantic]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+      - collection: REQUEST_HEADERS
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: detectSQLi
+      params:
+        min_fingerprint_len: 8
+        # **排除弱指纹**（那份弱信号单独由 SQLI-4011 承担）：
+        # `quote probing` 指"值本身就是引号"或 `1'`，而搜索框里搜一个引号字符
+        # 是正常行为。它留在这条 5 分规则里，等于"一个单引号封站" ——
+        # 正是设计里明确要避免的（评分制，而不是硬拦）。
+        exclude_fingerprints: ["quote probing"]
+    test:
+      positive:
+        - "1' union select 1,2,3--"
+        - "1' and (select count(*) from users)>0--"
+      negative:
+        - "select your country"
+        - "union square station"
+        - "Please order 3 boxes of paper"
+
+  # 弱信号单列一条：**分数低于阈值**，单独命中只记分、要和其他信号叠加才拦。
+  #
+  # 为什么值得留：`?id=1'` 是错误型注入最典型的探测形态，运维在控制台能看到
+  # "有人在拿引号探这个接口"，进而给那个路径单独加严或去看应用日志。
+  # 但它的误报面也是真实的（搜索框、筛选器里出现一个引号），所以只给 2 分。
+  - id: SQLI-4011
+    phase: 2
+    severity: low
+    category: sqli
+    score: 2
+    message: "SQL 注入迹象：值里出现单独引号（弱信号，仅记分）"
+    tags: [sqli, probe, weak-signal, detect-only]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: detectSQLi
+      params:
+        min_fingerprint_len: 8
+        fingerprints: ["quote probing"]
+    test:
+      positive:
+        - "1'"
+        - "'"
+      negative:
+        - "O'Brien"
+        - "it's a nice day"
+        - "Rock'n'Roll"
+
+  - id: SQLI-4010
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：堆叠查询"
+    tags: [sqli, owasp-a03, stacked-queries]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: ';\s*(?:select\s+(?:\*|\d|[a-z_]+\s*,)|insert\s+into|update\s+[a-z_]+\s+set|delete\s+from|drop\s+(?:table|database)|truncate\s+table|alter\s+table|create\s+(?:table|user|database)|grant\s+|revoke\s+|exec\s+|execute\s+|declare\s+|shutdown\b|call\s+[a-z_]+\()'
+    test:
+      positive:
+        - "1'; select 1,2--"
+        - "1';drop table users--"
+        - "1';insert into users values(1)--"
+        - "1';declare @a int--"
+      negative:
+        - "steps: 1; select the option below"
+        - "Choose an item; update your profile"
+        - "Please select; then confirm your choice"
+
+  - id: SQLI-4014
+    phase: 2
+    severity: critical
+    category: sqli
+    score: 5
+    message: "SQL 注入特征：引号后紧跟布尔运算符或未列入黑名单的关键字"
+    tags: [sqli, owasp-a03, quote-operator]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+      - collection: REQUEST_HEADERS
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - replaceComments
+      - compressWhitespace
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "[0-9a-z_)\\]][\"']\\s*(?:or|and|xor|div|regexp|like|having|order\\s+by|union|select|sleep|benchmark)\\b|[0-9a-z_)\\]][\"']\\s*(?:\\|\\||\\|)\\s*[\\s(0-9]"
+    test:
+      positive:
+        - "1' or(1)#"
+        - "1' or--1#"
+        - "1' | (1)#"
+        - "1' ||(1)#"
+        - "1' having 1=1#"
+        - "1' order by 2#"
+        - "1' xor 1=1#"
+        - "1' div 1#"
+        - "1' regexp 1#"
+      negative:
+        - "it's a nice day outside"
+        - "she said \"or\" maybe"
+        - "the list's order by date is in the docs"
+        - "O'Brien sent the report"
+        - "value=42"

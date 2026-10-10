@@ -1,0 +1,108 @@
+version: 1
+meta:
+  name: "安全审计"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+# 等保三级要求"对用户行为、重要操作进行审计，审计记录留存不少于六个月"。
+# 这一组检查的是审计能力本身是否在位：审计服务有没有跑、规则有没有配、
+# 日志会不会被随意改写、以及有没有做异地留存。
+
+checks:
+
+  - id: CHK-AU-001
+    title: "审计服务 auditd 正在运行"
+    category: 安全审计
+    severity: high
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "systemctl is-active auditd 2>/dev/null || service auditd status 2>&1 | head -n1 || echo NOT_FOUND"
+    expect:
+      type: regex_match
+      pattern: '^active$'
+    remedy: "启动并设为开机自启：systemctl enable --now auditd。没有审计服务时，关键操作与文件改动都不会留下记录。"
+
+  - id: CHK-AU-002
+    title: "已配置审计规则"
+    category: 安全审计
+    severity: high
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "auditctl -l 2>/dev/null | head -n 10"
+    expect:
+      type: regex_match
+      pattern: '(-w|-a|-A)'
+    remedy: "在 /etc/audit/rules.d/ 下补充规则并重启 auditd。至少应覆盖：账号与权限文件改动、执行命令、特权操作。"
+    note: "输出 No rules 表示一条规则都没配，等于审计服务空转。"
+
+  - id: CHK-AU-003
+    title: "关键文件与操作已纳入审计"
+    category: 安全审计
+    severity: high
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "auditctl -l 2>/dev/null | grep -E '/etc/passwd|/etc/shadow|/etc/sudoers|/etc/ssh|execve|setuid|setgid' | head -n 10"
+    expect:
+      type: regex_match
+      pattern: '(passwd|shadow|sudoers|ssh|execve|setuid|setgid)'
+    remedy: "为账号文件、sudoers、SSH 配置加上 -w 监视，并用 -a always,exit -F arch=b64 -S execve 记录命令执行。"
+
+  - id: CHK-AU-004
+    title: "系统日志服务正在运行"
+    category: 安全审计
+    severity: medium
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "systemctl is-active rsyslog syslog-ng 2>/dev/null | head -n1; command -v journalctl >/dev/null 2>&1 && echo 'journald 可用'"
+    expect:
+      type: manual
+    remedy: "确保 rsyslog（或 syslog-ng / journald）持续运行。纯 journald 的环境注意配置持久化存储（/var/log/journal），否则重启后日志会丢。"
+
+  - id: CHK-AU-005
+    title: "日志文件不可被普通用户改写"
+    category: 安全审计
+    severity: high
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "find /var/log -maxdepth 1 -type f -perm -0002 2>/dev/null | head -n 15"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "修正权限：chmod 640 <日志>，属主 root。日志可被非特权账号改写时，审计记录不具备可信性。"
+
+  - id: CHK-AU-006
+    title: "审计日志留存策略（人工确认）"
+    category: 安全审计
+    severity: medium
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "echo '--- logrotate 主配置 ---'; grep -E 'rotate|maxage|weekly|daily|monthly' /etc/logrotate.conf 2>/dev/null | head -n 8; echo '--- audit 轮转 ---'; cat /etc/logrotate.d/audit* 2>/dev/null | grep -E 'rotate|maxage|size|daily|weekly|monthly' | head -n 8; echo '--- 现存日志 ---'; ls -1 /var/log/ | head -n 20"
+    expect:
+      type: manual
+    remedy: "等保三级要求审计记录留存不少于 6 个月。按 6 个月反推 rotate 次数与轮转周期（例如每周轮转、保留 26 份），必要时配置 maxage 强制上限。"
+    note: "只呈现当前策略供人工核对，程序不替你判断周期是否够长。"
+
+  - id: CHK-AU-007
+    title: "登录记录文件存在且权限正确"
+    category: 安全审计
+    severity: medium
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "ls -l /var/log/wtmp /var/log/btmp /var/log/lastlog 2>/dev/null | awk '{print $1, $3, $4, $5, $9}'"
+    expect:
+      type: manual
+    remedy: "确保 wtmp/btmp/lastlog 存在且属主为 root（权限多为 600 或 664），否则登录与失败记录无法追溯。"
+
+  - id: CHK-AU-008
+    title: "日志异地留存已配置（人工确认）"
+    category: 安全审计
+    severity: medium
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "grep -rhE '^[^#]*(@@|@)[0-9a-zA-Z]' /etc/rsyslog.conf /etc/rsyslog.d/ 2>/dev/null | head -n 3; grep -rhE '^[^#]*(destination|network\\()' /etc/syslog-ng/ 2>/dev/null | head -n 3; echo '--- 若无输出表示未配置远程日志 ---'"
+    expect:
+      type: manual
+    remedy: "配置日志服务器：rsyslog 用 *.* @@日志服务器:514，syslog-ng 用 destination + network。本地日志被清理或被入侵者删除时，异地留存是唯一的追溯依据。"
+
+  - id: CHK-AU-009
+    title: "审计日志未被排除在轮转清理之外"
+    category: 安全审计
+    severity: low
+    refs: ["等保 8.1.4.3 安全审计"]
+    command: "grep -rE '/var/log/(audit|secure|auth)' /etc/logrotate.d/ 2>/dev/null | head -n 5; ls -1 /var/log/audit/ 2>/dev/null | head -n 5"
+    expect:
+      type: manual
+    remedy: "确认审计日志有独立的轮转配置，且不会被 'rm -f *.log' 这类通配清理脚本误删。"

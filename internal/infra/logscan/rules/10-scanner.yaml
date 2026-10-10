@@ -1,0 +1,278 @@
+# 扫描器与工具指纹
+#
+# 扫描器规则天生容易误伤正常爬虫与监控，所以策略是：
+#   - UA / 特征头类给低分（2~3），命中只加分不单独拦；
+#   - 只有"版本控制目录、备份文件、管理端点"这类正常业务永不访问的路径才给高分，
+#     且不采用 /robots.txt、/console、/debug 这类正常站点也有的路径（那是误报来源）。
+version: 1
+meta:
+  name: "扫描器与工具指纹"
+  author: "qingli"
+  category: scanner
+
+rules:
+
+  - id: SCAN-2001
+    phase: 1
+    severity: low
+    category: scanner
+    score: 2
+    message: "User-Agent 命中已知扫描器 / 自动化工具指纹"
+    tags: [scanner, user-agent, recon]
+    targets:
+      - collection: REQUEST_HEADERS
+        selector: "user-agent"
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "sqlmap"
+          - "nikto"
+          - "nmap"
+          - "masscan"
+          - "zmap"
+          - "acunetix"
+          - "nessus"
+          - "openvas"
+          - "netsparker"
+          - "appscan"
+          - "w3af"
+          - "dirbuster"
+          - "dirsearch"
+          - "gobuster"
+          - "feroxbuster"
+          - "dirb"
+          - "wfuzz"
+          - "ffuf"
+          - "hydra"
+          - "zgrab"
+          - "nuclei"
+          - "xray"
+          - "crackweb"
+          - "zaproxy"
+          - "owasp zap"
+          - "burpsuite"
+          - "burp suite"
+          - "paros"
+          - "vega"
+          - "wpscan"
+          - "joomscan"
+          - "arachni"
+          - "skipfish"
+          - "whatweb"
+          - "wafw00f"
+          - "commix"
+          - "havij"
+          - "pangolin"
+          - "grendel-scan"
+          - "unicornscan"
+          - "sublist3r"
+          - "gospider"
+          - "hakrawler"
+          - "katana"
+          - "jaeles"
+    action:
+      type: log
+    test:
+      positive:
+        - "sqlmap/1.7.2#stable (https://sqlmap.org)"
+        - "Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)"
+        - "gobuster/3.6"
+      negative:
+        - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        - "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        - "curl/8.4.0"
+
+  # 扫描器自己留下的、业务上不可能出现的探测路径。
+  - id: SCAN-2002
+    phase: 1
+    severity: medium
+    category: scanner
+    score: 3
+    message: "请求路径命中扫描器专用探测路径"
+    tags: [scanner, probe-path, recon]
+    targets:
+      - collection: REQUEST_PATH
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "/acunetix-wvs-test-for-some-inexistent-file"
+          - "/netsparker"
+          - "/nessus"
+          - "/sdk/weblanguage"
+          - "/evox/about"
+          - "/hnap1"
+          - "/tmui/login.jsp"
+          - "/solr/admin/cores"
+          - "/telescope/requests"
+    action:
+      type: log
+    test:
+      positive:
+        - "/acunetix-wvs-test-for-some-inexistent-file"
+        - "/sdk/webLanguage"
+        - "/tmui/login.jsp"
+      negative:
+        - "/api/v1/orders"
+        - "/assets/js/app.js"
+        - "/product/1234/reviews"
+
+  # 版本控制目录与点文件泄露。正常业务永不请求这些路径；
+  # 刻意不匹配 /.well-known（ACME 校验用）与 /.github（与 /.git 只差一个字母）。
+  - id: SCAN-2003
+    phase: 1
+    severity: high
+    category: scanner
+    score: 5
+    message: "请求路径指向版本控制目录或点文件（源码与凭据泄露）"
+    tags: [scanner, dotfile, source-disclosure, owasp-a05]
+    targets:
+      - collection: REQUEST_PATH
+    transforms:
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "(?:^|/)\\.(?:git|svn|hg|bzr|env|ds_store|ssh|aws|htaccess|htpasswd|npmrc|dockerenv|git-credentials|bash_history|mysql_history|netrc|pgpass)(?:/|\\.|$)|(?:^|/)web\\.config$|(?:^|/)web-inf/web\\.xml$|(?:^|/)meta-inf/|(?:^|/)id_rsa(?:\\.|$)"
+    test:
+      positive:
+        - "/.git/config"
+        - "/.svn/entries"
+        - "/.env"
+        - "/.DS_Store"
+        - "/WEB-INF/web.xml"
+        - "/.aws/credentials"
+        - "/id_rsa"
+      negative:
+        - "/.well-known/acme-challenge/8f3a-token"
+        - "/.github/workflows/ci.yml"
+        - "/assets/js/app.js"
+        - "/api/v1/orders?id=42"
+
+  # 备份文件与运维信息页。比上一条弱一档：给 4 分，单条命中只记分。
+  - id: SCAN-2004
+    phase: 1
+    severity: high
+    category: scanner
+    score: 4
+    message: "请求路径指向备份文件或运维信息页"
+    tags: [scanner, backup-file, info-disclosure]
+    targets:
+      - collection: REQUEST_PATH
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "/backup.zip"
+          - "/backup.rar"
+          - "/backup.tar.gz"
+          - "/backup.tar"
+          - "/backup.7z"
+          - "/backup.sql"
+          - "/backup.old"
+          - "/db.sql"
+          - "/db.zip"
+          - "/db.tar.gz"
+          - "/database.sql"
+          - "/database.zip"
+          - "/dump.sql"
+          - "/dump.sql.gz"
+          - "/data.sql"
+          - "/users.sql"
+          - "/members.sql"
+          - "/www.zip"
+          - "/wwwroot.zip"
+          - "/www.tar.gz"
+          - "/web.zip"
+          - "/site.zip"
+          - "/site.tar.gz"
+          - "/html.zip"
+          - "/htdocs.zip"
+          - "/public_html.zip"
+          - "/config.php.bak"
+          - "/config.php.old"
+          - "/config.php.save"
+          - "/config.php.swp"
+          - "/config.php.txt"
+          - "/config.inc.php.bak"
+          - "/wp-config.php.bak"
+          - "/wp-config.php.old"
+          - "/wp-config.php.save"
+          - "/wp-config.php.txt"
+          - "/index.php.bak"
+          - "/index.php.old"
+          - "/index.php.save"
+          - "/index.php.swp"
+          - "/install.php.bak"
+          - "/server-status"
+          - "/server-info"
+          - "/phpinfo.php"
+    action:
+      type: log
+    test:
+      positive:
+        - "/backup.zip"
+        - "/db.sql"
+        - "/wp-config.php.bak"
+        - "/server-status"
+      negative:
+        - "/downloads/report-2024.pdf"
+        - "/api/v1/users/me"
+        - "/assets/img/logo.png"
+
+  # 管理 / 调试端点。刻意不含 /actuator/health（合法健康检查）、
+  # 不含 /console 与 /debug（正常站点也可能有同名页面）。
+  - id: SCAN-2005
+    phase: 1
+    severity: medium
+    category: scanner
+    score: 3
+    message: "请求路径指向管理或调试端点"
+    tags: [scanner, admin-endpoint, debug-endpoint]
+    targets:
+      - collection: REQUEST_PATH
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "/actuator/env"
+          - "/actuator/heapdump"
+          - "/actuator/dump"
+          - "/actuator/jolokia"
+          - "/actuator/configprops"
+          - "/actuator/beans"
+          - "/actuator/mappings"
+          - "/actuator/threaddump"
+          - "/actuator/loggers"
+          - "/actuator/httptrace"
+          - "/jolokia/read"
+          - "/jolokia/exec"
+          - "/manager/html"
+          - "/manager/status"
+          - "/host-manager/html"
+          - "/jenkins/script"
+          - "/scripttext"
+          - "/debug/pprof"
+          - "/debug/vars"
+          - "/zabbix/api_jsonrpc.php"
+          - "/hystrix.stream"
+    action:
+      type: log
+    test:
+      positive:
+        - "/actuator/env"
+        - "/manager/html"
+        - "/debug/pprof/heap"
+      negative:
+        - "/actuator/health"
+        - "/api/v1/status"
+        - "/healthz"

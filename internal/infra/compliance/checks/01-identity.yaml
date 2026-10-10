@@ -1,0 +1,124 @@
+version: 1
+meta:
+  name: "身份鉴别"
+  standard: "GB/T 22239-2019"
+  level: "三级"
+  author: "awdshell"
+
+# 说明：命令用于读取配置与状态；判定规则写在 expect 里。
+# 判定规则写在 expect 里，不同等级要求不同时改这里即可，不用改程序。
+
+checks:
+
+  - id: CHK-ID-001
+    title: "禁止 root 账号直接 SSH 登录"
+    category: 身份鉴别
+    severity: high
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.2.8"]
+    command: "sshd -T 2>/dev/null | grep -i '^permitrootlogin' || grep -iE '^[[:space:]]*PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)permitrootlogin[[:space:]]+yes'
+    remedy: "在 /etc/ssh/sshd_config 中设置 PermitRootLogin no（或 prohibit-password），然后重启 sshd。改用普通账号登录后 sudo 提权。"
+
+  - id: CHK-ID-002
+    title: "不存在空口令账号"
+    category: 身份鉴别
+    severity: critical
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 6.2.1"]
+    command: "awk -F: '($2==\"\"){print $1}' /etc/shadow 2>/dev/null"
+    expect:
+      type: regex_not_match
+      pattern: '\S'
+    remedy: "为空口令账号设置强口令，或锁定不需要登录的账号（passwd -l 账号）。"
+    needs_root: true
+    note: "需要 root 权限读取 /etc/shadow，普通账号执行会得到空结果（会显示为通过，请以 root 运行）。"
+
+  - id: CHK-ID-003
+    title: "口令最长有效期不超过 90 天"
+    category: 身份鉴别
+    severity: medium
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.4.1.1"]
+    command: "grep -iE '^[[:space:]]*PASS_MAX_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}' | head -n1"
+    expect:
+      type: numeric_max
+      value: 90
+    remedy: "在 /etc/login.defs 中设置 PASS_MAX_DAYS 90，并用 chage -M 90 账号 应用到已有账号。"
+
+  - id: CHK-ID-004
+    title: "口令最小长度不少于 8 位"
+    category: 身份鉴别
+    severity: medium
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.4.1"]
+    command: "grep -iE '^[[:space:]]*minlen' /etc/security/pwquality.conf 2>/dev/null | head -n1 | awk -F= '{gsub(/ /,\"\",$2); print $2}'"
+    expect:
+      type: numeric_min
+      value: 8
+    remedy: "在 /etc/security/pwquality.conf 中设置 minlen = 8（三级建议 8 位以上并含多类字符）。"
+
+  - id: CHK-ID-005
+    title: "配置了登录失败处理（失败锁定）"
+    category: 身份鉴别
+    severity: high
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.3.2"]
+    command: "grep -rhE 'pam_faillock|pam_tally2' /etc/pam.d/ 2>/dev/null | head -n3"
+    expect:
+      type: regex_match
+      pattern: 'pam_(faillock|tally2)'
+    remedy: "在 /etc/pam.d/system-auth 与 /etc/pam.d/password-auth 中启用 pam_faillock（deny=5 unlock_time=900）。"
+
+  - id: CHK-ID-006
+    title: "SSH 禁止空口令登录"
+    category: 身份鉴别
+    severity: critical
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.2.9"]
+    command: "sshd -T 2>/dev/null | grep -i '^permitemptypasswords' || grep -iE '^[[:space:]]*PermitEmptyPasswords' /etc/ssh/sshd_config 2>/dev/null"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)permitemptypasswords[[:space:]]+yes'
+    remedy: "在 /etc/ssh/sshd_config 中设置 PermitEmptyPasswords no。"
+
+  - id: CHK-ID-007
+    title: "SSH 未启用密码认证（推荐仅密钥）"
+    category: 身份鉴别
+    severity: medium
+    refs: ["等保 8.1.4.1 身份鉴别"]
+    command: "sshd -T 2>/dev/null | grep -i '^passwordauthentication' || grep -iE '^[[:space:]]*PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null"
+    expect:
+      type: regex_not_match
+      pattern: '(?i)passwordauthentication[[:space:]]+yes'
+    remedy: "确认所有账号都已配置密钥后，在 /etc/ssh/sshd_config 中设置 PasswordAuthentication no。"
+    note: "若确有账号依赖密码登录，这条可判为不适用 —— 属人为取舍，不是配置错误。"
+
+  - id: CHK-ID-008
+    title: "登录会话空闲超时不超过 600 秒"
+    category: 身份鉴别
+    severity: low
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.4.5"]
+    command: "grep -rhoE 'TMOUT=[0-9]+' /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | head -n1 | cut -d= -f2"
+    expect:
+      type: numeric_max
+      value: 600
+    remedy: "在 /etc/profile 中设置 readonly TMOUT=600 并 export，使空闲会话自动退出。"
+
+  - id: CHK-ID-009
+    title: "配置了口令复杂度要求"
+    category: 身份鉴别
+    severity: medium
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.4.1"]
+    command: "grep -iE '^[[:space:]]*(minclass|dcredit|ucredit|lcredit|ocredit)' /etc/security/pwquality.conf 2>/dev/null | head -n5"
+    expect:
+      type: regex_match
+      pattern: '(minclass[[:space:]]*=[[:space:]]*[3-9]|[duol]credit[[:space:]]*=[[:space:]]*-[0-9])'
+    remedy: "在 /etc/security/pwquality.conf 中要求至少三类字符：minclass = 3，或分别设置 dcredit/ucredit/lcredit/ocredit 为负值。"
+
+  - id: CHK-ID-010
+    title: "禁止重复使用最近 5 次以内的口令"
+    category: 身份鉴别
+    severity: low
+    refs: ["等保 8.1.4.1 身份鉴别", "CIS 5.4.4"]
+    command: "grep -rhoE 'remember=[0-9]+' /etc/pam.d/system-auth /etc/pam.d/common-password /etc/pam.d/password-auth 2>/dev/null | head -n1 | cut -d= -f2"
+    expect:
+      type: numeric_min
+      value: 5
+    remedy: "在 PAM 的 password 段加入 pam_pwhistory 或 pam_unix 的 remember=5 参数。"
