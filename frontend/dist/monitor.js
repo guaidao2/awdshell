@@ -21,7 +21,16 @@
     // 是否跟随当前激活的终端会话；用户手动改过下拉就置 false。
     // 必须显式给默认值：缺了它 !undefined 恒为真，同步逻辑会被自己挡掉。
     followActive: true,
-    filter: ''
+    filter: '',
+    // 采样序号：切目标或重新发起采样时自增，用来丢弃"切了目标才回来"的旧响应。
+    // 必须有默认值 —— 缺了它 ++undefined 是 NaN，而 NaN !== NaN 恒真，
+    // 会把所有响应都当成过期丢掉（界面永远不刷新）。
+    loadSeq: 0,
+    // 上一次**成功**采样的本地时刻：状态栏用它显示真实间隔，而不是宣称"每 3 秒"
+    lastOkAt: 0,
+    // 采样期间又被要求刷新（单飞闸把这次 tick 吞了）。必须显式给默认值，
+    // 而且被吞这件事要让用户看得见，见 load()。
+    pendingReload: false
   };
 
   // ---------- 工具 ----------
@@ -31,6 +40,10 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
+
+  // 数值字段兜底：后端少给一个字段时不能让它冒成 "Cannot read properties of undefined"
+  //（toFixed 挂在 undefined 上），界面宁可显示 0。
+  function num(v) { return Number(v) || 0; }
 
   function fmtBytes(n) {
     n = Number(n) || 0;
@@ -83,7 +96,7 @@
       '  <select id="mo-target" class="mo-target"></select>' +
       '  <button id="mo-sync" class="mo-sync" title="默认跟随当前终端会话；手动选过目标后会锁定，点这里恢复跟随"></button>' +
       '  <button id="mo-refresh">刷新</button>' +
-      '  <label class="mo-follow" title="每 3 秒自动采样"><input type="checkbox" id="mo-auto" checked /> 自动</label>' +
+      '  <label class="mo-follow" title="每 3 秒触发一次采样；上一次没返回时会跳过本次，状态栏会说明"><input type="checkbox" id="mo-auto" checked /> 自动</label>' +
       '  <span class="mo-ts" id="mo-ts"></span>' +
       '</div>' +
       '<div class="mo-body" id="mo-body">' +
@@ -111,9 +124,13 @@
 
     $('mo-target').addEventListener('change', function () {
       state.targetId = this.value;
+      state.loadSeq++; // 作废在途的采样响应
       // 用户手动选了目标：这个视图锁定它，不再跟着会话跑
       state.followActive = false;
       state.netHistory = [];
+      // 换主机了："距上次 N 秒"不能跨主机算（这个值以前只在这里漏了重置，
+      // 于是一切目标，状态栏显示的是距**上一台**采样过了多久）
+      state.lastOkAt = 0;
       renderSyncState();
       load(true);
     });
@@ -154,6 +171,14 @@
 
   // ---------- 各卡片 ----------
 
+  // proc_total 为 -1 表示"没采到进程数"（不是 0 个进程）—— 以前 `|| 0` 会把它
+  // 画成 "0"，看起来像一台干净空闲的机器，那是错误数据不是缺失数据。
+  function fmtProcTotal(v) {
+    var n = Number(v);
+    if (!isFinite(n) || n < 0) return '--';
+    return String(n);
+  }
+
   function renderOS(m) {
     $('mo-os').innerHTML =
       '<div class="mo-os-head">' +
@@ -163,26 +188,28 @@
       '<div class="mo-os-rows">' +
       '  <span>内核 <b>' + esc(m.kernel || '-') + '</b></span>' +
       '  <span>运行 <b>' + fmtUptime(m.uptime_sec) + '</b></span>' +
-      '  <span>进程 <b>' + (m.proc_total || 0) + '</b></span>' +
+      '  <span>进程 <b>' + fmtProcTotal(m.proc_total) + '</b></span>' +
       '</div>';
   }
 
   function renderCPU(m) {
+    var cpuPct = num(m.cpu_percent);
     var cores = (m.cpu_cores || []).map(function (c) {
+      var cp = num(c.percent);
       return '<div class="mo-core">' +
-        '<span class="mo-core-id">' + c.id + '</span>' +
-        '<span class="mo-core-bar"><i class="' + level(c.percent) + '" style="width:' + Math.max(1.5, c.percent).toFixed(1) + '%"></i></span>' +
-        '<span class="mo-core-num">' + c.percent.toFixed(1) + '%</span>' +
+        '<span class="mo-core-id">' + esc(c.id) + '</span>' +
+        '<span class="mo-core-bar"><i class="' + level(cp) + '" style="width:' + Math.max(1.5, cp).toFixed(1) + '%"></i></span>' +
+        '<span class="mo-core-num">' + cp.toFixed(1) + '%</span>' +
         '</div>';
     }).join('');
 
     $('mo-cpu').innerHTML =
       '<div class="mo-card-head">' +
       '  <span>CPU</span>' +
-      '  <span class="mo-big ' + level(m.cpu_percent) + '">' + m.cpu_percent.toFixed(1) + '%</span>' +
+      '  <span class="mo-big ' + level(cpuPct) + '">' + cpuPct.toFixed(1) + '%</span>' +
       '</div>' +
-      '<span class="mo-bar"><i class="' + level(m.cpu_percent) + '" style="width:' + Math.max(1, m.cpu_percent).toFixed(1) + '%"></i></span>' +
-      '<div class="mo-sub">负载 ' + m.load1.toFixed(2) + ' / ' + m.load5.toFixed(2) + ' / ' + m.load15.toFixed(2) +
+      '<span class="mo-bar"><i class="' + level(cpuPct) + '" style="width:' + Math.max(1, cpuPct).toFixed(1) + '%"></i></span>' +
+      '<div class="mo-sub">负载 ' + num(m.load1).toFixed(2) + ' / ' + num(m.load5).toFixed(2) + ' / ' + num(m.load15).toFixed(2) +
       '　' + (m.cpu_cores || []).length + ' 核</div>' +
       (cores ? '<div class="mo-cores">' + cores + '</div>' : '');
   }
@@ -193,7 +220,7 @@
     var cached = m.mem_cached || 0;
     var buffers = m.mem_buffers || 0;
     var free = Math.max(0, total - used);
-    var pct = m.mem_percent || 0;
+    var pct = num(m.mem_percent);
 
     // 环形图：conic-gradient 画已用 / 缓存 / 剩余三段
     var usedDeg = total > 0 ? (used / total) * 360 : 0;
@@ -271,10 +298,11 @@
     }).slice(0, 6);
 
     var rows = disks.map(function (d) {
+      var dp = num(d.percent);
       return '<div class="mo-disk">' +
         '<div class="mo-disk-head"><span class="k">' + esc(d.mount) + '</span>' +
-        '<span class="v">' + fmtBytes(d.used) + ' / ' + fmtBytes(d.total) + ' · ' + d.percent.toFixed(1) + '%</span></div>' +
-        '<span class="mo-bar"><i class="' + level(d.percent) + '" style="width:' + Math.max(1, d.percent).toFixed(1) + '%"></i></span>' +
+        '<span class="v">' + fmtBytes(d.used) + ' / ' + fmtBytes(d.total) + ' · ' + dp.toFixed(1) + '%</span></div>' +
+        '<span class="mo-bar"><i class="' + level(dp) + '" style="width:' + Math.max(1, dp).toFixed(1) + '%"></i></span>' +
         '<div class="mo-disk-dev">' + esc(d.device) + '</div></div>';
     }).join('');
 
@@ -293,20 +321,23 @@
 
     function bars(items, prefix) {
       if (!items.length) return '';
-      var max = items[0].count || 1;
+      var max = num(items[0].count) || 1;
       return items.slice(0, 6).map(function (p) {
+        var pc = num(p.count);
         return '<div class="mo-conn-bar">' +
           '<span class="k">' + prefix + esc(p.name) + '</span>' +
-          '<span class="b"><i style="width:' + Math.max(6, (p.count / max) * 100).toFixed(1) + '%"></i></span>' +
-          '<span class="v">' + p.count + '</span></div>';
+          '<span class="b"><i style="width:' + Math.max(6, (pc / max) * 100).toFixed(1) + '%"></i></span>' +
+          '<span class="v">' + pc + '</span></div>';
       }).join('');
     }
 
     var list = conns.slice(0, 30).map(function (c) {
       return '<div class="mo-conn-row" title="' + esc(c.process || '') + '">' +
         '<span class="st st-' + esc(String(c.state).toLowerCase()) + '">' + esc(c.state) + '</span>' +
-        '<span class="ep">' + esc(c.remote) + ':' + c.rport + '</span>' +
-        '<span class="lp">← :' + c.lport + '</span>' +
+        // 端口走后端解析成 int，仍然照全站规矩 esc 一次：将来解析改成透传字符串时
+        // 这里不会再变成一个 HTML 注入点
+        '<span class="ep">' + esc(c.remote) + ':' + esc(c.rport) + '</span>' +
+        '<span class="lp">← :' + esc(c.lport) + '</span>' +
         '<span class="proc">' + esc(c.process || '-') + '</span>' +
         '</div>';
     }).join('');
@@ -332,7 +363,7 @@
       var pub = l.addr !== '127.0.0.1' && l.addr !== '::1' && l.addr !== '';
       return '<div class="mo-listen-row">' +
         '<span class="proto">' + esc(l.proto) + '</span>' +
-        '<span class="port' + (pub ? ' pub' : '') + '">' + l.port + '</span>' +
+        '<span class="port' + (pub ? ' pub' : '') + '">' + esc(l.port) + '</span>' +
         '<span class="addr">' + esc(l.addr || '*') + '</span>' +
         '<span class="proc">' + esc(l.process || '-') + '</span>' +
         '</div>';
@@ -346,8 +377,10 @@
   function renderProcs() {
     var m = state.metric;
     if (!m) return;
-    var total = m.proc_total || 0;
-    $('mo-proc-total').textContent = total + ' 个 · 列出 ' + (m.procs || []).length + ' 个';
+    var totalTxt = fmtProcTotal(m.proc_total);
+    $('mo-proc-total').textContent = totalTxt === '--'
+      ? '未采集到进程数 · 列出 ' + (m.procs || []).length + ' 个'
+      : totalTxt + ' 个 · 列出 ' + (m.procs || []).length + ' 个';
 
     var list = (m.procs || []).slice();
     if (state.filter) {
@@ -359,11 +392,11 @@
       });
     }
     if (state.sortBy === 'mem') {
-      list.sort(function (a, b) { return b.mem - a.mem; });
+      list.sort(function (a, b) { return num(b.mem) - num(a.mem); });
     } else if (state.sortBy === 'pid') {
-      list.sort(function (a, b) { return a.pid - b.pid; });
+      list.sort(function (a, b) { return num(a.pid) - num(b.pid); });
     } else {
-      list.sort(function (a, b) { return b.cpu - a.cpu; });
+      list.sort(function (a, b) { return num(b.cpu) - num(a.cpu); });
     }
 
     // 进程列表每 3 秒整体重建，不保留滚动位置的话永远读不完 ——
@@ -380,11 +413,12 @@
       '<div class="mo-proc head"><span class="pid">PID</span><span class="user">用户</span>' +
       '<span class="cpu">CPU%</span><span class="mem">MEM%</span><span class="cmd">命令</span></div>' +
       list.map(function (p) {
+        var pc = num(p.cpu);
         return '<div class="mo-proc" title="' + esc(p.args) + '">' +
-          '<span class="pid">' + p.pid + '</span>' +
+          '<span class="pid">' + esc(p.pid) + '</span>' +
           '<span class="user">' + esc(p.user) + '</span>' +
-          '<span class="cpu ' + (p.cpu >= 50 ? 'hot' : '') + '">' + p.cpu.toFixed(1) + '</span>' +
-          '<span class="mem">' + p.mem.toFixed(1) + '</span>' +
+          '<span class="cpu ' + (pc >= 50 ? 'hot' : '') + '">' + pc.toFixed(1) + '</span>' +
+          '<span class="mem">' + num(p.mem).toFixed(1) + '</span>' +
           '<span class="cmd">' + esc(p.comm) + '</span>' +
           '</div>';
       }).join('');
@@ -394,6 +428,12 @@
   }
 
   function render(m) {
+    // 后端给的不是对象（代理错误页、接口版本不匹配）时不要让它冒成
+    // "Cannot read properties of undefined"，说一句人能看懂的话就退回
+    if (!m || typeof m !== 'object') {
+      setStatus('监控：数据格式不符合预期，已跳过这次刷新');
+      return;
+    }
     state.metric = m;
 
     // 记录网络历史用于折线
@@ -411,7 +451,7 @@
     renderConn(m);
     renderListeners(m);
     renderProcs();
-    $('mo-ts').textContent = new Date(m.ts).toLocaleTimeString();
+    $('mo-ts').textContent = m.ts ? new Date(m.ts).toLocaleTimeString() : '--';
   }
 
   // ---------- 数据 ----------
@@ -421,8 +461,8 @@
     // 目标可能已被删除：清掉悬空的 targetId 与它留下的采样历史
     if (state.targetId && !state.targets.some(function (t) { return t.id === state.targetId; })) {
       state.targetId = '';
-      state.last = null;
-      state.lastAt = 0;
+      state.loadSeq++;
+      state.lastOkAt = 0; // 换过主机了：上一次成功采样的时刻不能再拿来算间隔
       state.netHistory = [];
     }
     if (!state.targetId && state.targets.length) state.targetId = state.targets[0].id;
@@ -434,18 +474,48 @@
   async function load(showStatus) {
     if (!state.targetId) return;
     if (state.loading) {
+      // 单飞闸把这次刷新吞掉了，而界面以前还在写"每 3 秒自动刷新"。
+      // 慢链路下单次采样可能超过 3 秒，后续 tick 会被连着吞掉，
+      // 挖矿、反弹 shell 这类短命进程完全可能落在被吞掉的空档里 ——
+      // 所以被吞这件事必须让用户看见，同时报出上一次真正采到的时刻。
       state.pendingReload = true;
+      setStatus('监控：上一次采样还没返回，这次刷新已跳过（上次成功 ' +
+        (state.lastOkAt ? new Date(state.lastOkAt).toLocaleTimeString() : '未知') + '）');
       return;
     }
     state.loading = true;
+    // 记下这一轮属于哪次请求、针对哪台目标。采样期间切了目标的话，
+    // 这份响应回来时**不能往界面上贴** —— 否则 B 的目标下拉底下显示的
+    // 是 A 的进程名、对端 IP、监听端口，而用户在对着它做判断。
+    var seq = ++state.loadSeq;
+    var tid = state.targetId;
     if (showStatus) setStatus('正在采集 …');
     try {
-      var m = await req('/api/monitor?target_id=' + encodeURIComponent(state.targetId));
+      var m = await req('/api/monitor?target_id=' + encodeURIComponent(tid));
+      if (seq !== state.loadSeq || tid !== state.targetId) return;
       var old = $('mo-err');
       if (old) old.remove();
       render(m);
-      setStatus('监控：' + (state.auto ? '每 3 秒自动刷新' : '手动刷新') + '　' + new Date(m.ts).toLocaleTimeString());
+      // 不再宣称"每 3 秒自动刷新"：那是设定值，不是实际值（见上面单飞闸）。
+      // 直接给出这一次成功采样的真实时刻，以及距上一次成功采样实际过了多久。
+      var now = Date.now();
+      var gapSec = state.lastOkAt ? Math.round((now - state.lastOkAt) / 1000) : 0;
+      state.lastOkAt = now;
+      // collected=false / problems 的提示**必须与这句合并成一次 setStatus**：
+      // setStatus 就是 textContent=，先写会被后写覆盖，消息活不过几毫秒
+      //（上一版就是这么写的，commit 说"已消费 collected"，界面上根本看不到）。
+      var note = "";
+      if (m.collected === false) {
+        note = "　未采集到关键指标，面板数值不可信" +
+          ((m.missing || []).length ? "（未采集到：" + (m.missing || []).join("、") + "）" : "");
+      } else if ((m.problems || []).length) {
+        note = "　" + (m.problems || []).join("；");
+      }
+      setStatus('监控：上次成功采样 ' + (m.ts ? new Date(m.ts).toLocaleTimeString() : new Date(now).toLocaleTimeString()) +
+        (gapSec ? '（距上次 ' + gapSec + ' 秒）' : '') +
+        (state.auto ? '' : '　手动刷新') + note);
     } catch (e) {
+      if (seq !== state.loadSeq || tid !== state.targetId) return;
       var body = $('mo-body');
       if (body && !$('mo-err')) {
         body.insertAdjacentHTML('afterbegin', '<div class="mo-empty error-text" id="mo-err">采集失败：' + esc(e.message) + '</div>');
@@ -484,9 +554,9 @@
     var tid = window.AwdActiveTarget ? window.AwdActiveTarget() : '';
     if (!tid || tid === state.targetId) { renderSyncState(); return false; }
     state.targetId = tid;
+    state.loadSeq++; // 换主机了：在途的旧采样响应一律作废
     state.netHistory = [];
-    state.last = null;
-    state.lastAt = 0;
+    state.lastOkAt = 0; // 换主机：状态栏的"距上次 N 秒"不能跨主机算
     state.pendingReload = false;
     renderTargets();
     renderSyncState();
@@ -495,7 +565,11 @@
 
   function schedule() {
     if (state.timer) { clearInterval(state.timer); state.timer = null; }
-    if (!state.auto) return;
+    // 面板**看不见**时连定时器都不该起：分屏、或打开基线核查/日志检测这类整页视图时，
+    // 监控面板只是被 hidden 掉，而定时器仍会每 3 秒醒一次、对目标机白跑一次采集
+    //（SSH 往返 + 远端 ps/ss/proc）。在 AWD 里那是白花预算，慢链路下还会和别的视图
+    // 抢同一条共享 SSH 连接。
+    if (!state.auto || !monitorReallyVisible()) return;
     state.timer = setInterval(function () {
       if (monitorReallyVisible() && !document.hidden) load(false);
     }, state.intervalMs);
@@ -555,10 +629,33 @@
     window.addEventListener('awdshell:connected', function () {
       if (syncToActiveSession() && !$('monitor-area').hidden) load(true);
     });
-    // 目标被新建或删除后重取列表
+    // 关掉某个目标的最后一个 SSH 标签时，监控一起收起：
+    // 别的视图（文件面板 / 日志检测 / 基线核查）都有这个联动，监控原来漏了，
+    // 于是目标都关掉了它还在每 3 秒对着那台机器采一次
+    window.addEventListener('awdshell:session-closed', function (e) {
+      var d = (e && e.detail) || {};
+      var area = $('monitor-area');
+      if (!area || area.hidden) return;
+      if (d.targetId !== state.targetId) return;
+      var remaining = d.remainingTargets || [];
+      if (remaining.indexOf(state.targetId) >= 0) return;
+      setMonitorVisible(false);
+      setStatus('该目标的会话已全部关闭，监控已收起');
+    });
+    // 目标被新建或删除后重取列表。
+    // loadTargets 自己会把被删掉的目标换成列表里的第一台（并作废在途响应）；
+    // 这里只补它没做的那件事：**目标真的换了**时，把采样历史与"上次成功时刻"
+    // 一起重置，并重采一次 —— 否则界面会一直停在已删那台的旧数据上。
+    // （以前这里写的是 `if (!state.targetId && ...) loadSeq++`，而 loadTargets
+    // 在上一行就已经把 targetId 填好了，那个分支永远不成立。）
     window.addEventListener('awdshell:targets-changed', function () {
+      var before = state.targetId;
       loadTargets().then(function () {
-        if (!state.targetId && state.targets.length) state.targetId = state.targets[0].id;
+        if (state.targetId === before) return;
+        state.loadSeq++;
+        state.netHistory = [];
+        state.lastOkAt = 0;
+        if (!$('monitor-area').hidden) load(true);
       }).catch(function () {});
     });
     loadTargets().catch(function () { /* 首次打开时会再试 */ });

@@ -325,7 +325,13 @@
       if (info && info.fallback) {
         setStatus('初始目录 ' + info.wanted + ' 不存在，已回退到 ' + info.path);
       }
-    } catch (e) { /* 回退到根目录 */ }
+    } catch (e) {
+      // 原来是空 catch：读不到初始目录就悄悄落到 /，用户看到的是"莫名其妙在根目录"。
+      // 这里不能用 setStatus —— 紧接着的 loadDir 会把它覆盖掉，用浮层提示才留得住。
+      if (window.AwdToast) {
+        window.AwdToast.warn('读取初始目录失败，已从根目录 / 开始（' + e.message + '）');
+      }
+    }
     await loadDir(startPath);
   }
 
@@ -423,10 +429,23 @@
   }
 
   async function doDownload(entry) {
+    var dir = (window.AWD_SETTINGS && window.AWD_SETTINGS.download_dir) || '';
     setStatus('正在下载 ' + entry.name + ' ...');
     try {
-      // 走 fetch 而不是 <a download>：后者拿不到失败（权限不足、目录、连接断），
-      // 用户会拿到一个 0 字节文件还以为下载成功了。
+      if (dir) {
+        // 配了默认下载目录：让后端把远端文件**流式**写到那里。
+        // 既不经过浏览器（浏览器只能落到系统默认下载目录），
+        // 也不会把整个文件读进内存 —— 大文件下载因此也轻了。
+        var r = await req('/api/files/save-to-dir', {
+          method: 'POST',
+          body: JSON.stringify({ target_id: state.targetId, path: entry.path })
+        });
+        setStatus('已下载到 ' + r.saved_to);
+        window.AwdToast.ok('已保存到\n' + r.saved_to);
+        return;
+      }
+      // 没配目录：走浏览器下载（走 fetch 而不是 <a download>，
+      // 后者拿不到失败——权限不足、目录、连接断都会变成 0 字节的"成功"文件）
       var res = await fetch(API + '/api/files/download?target_id=' + encodeURIComponent(state.targetId) +
         '&path=' + encodeURIComponent(entry.path));
       if (!res.ok) {
@@ -490,13 +509,18 @@
   var cm = null;
   var loadedModes = {};
 
+  // 扩展名 → 语法模式。
+  //
+  // .php 是混合模式：依赖 clike + htmlmixed（而 htmlmixed 又依赖 xml/javascript/css），
+  // 全部列在 MODE_DEPS 里按顺序加载。缺一个 CodeMirror 都会静默退回 null 模式，
+  // 然后在缩进时抛内部错误，看着就像编辑器坏了。
   var MODE_BY_EXT = {
     '.sh': 'shell', '.bash': 'shell', '.zsh': 'shell', '.ksh': 'shell',
     '.js': 'javascript', '.mjs': 'javascript', '.json': 'javascript',
-    '.py': 'python',
-    '.xml': 'xml', '.html': 'xml', '.htm': 'xml', '.svg': 'xml',
+    '.py': 'python', '.php': 'php',
+    '.xml': 'xml', '.html': 'htmlmixed', '.htm': 'htmlmixed', '.svg': 'xml',
     '.css': 'css', '.yml': 'yaml', '.yaml': 'yaml', '.sql': 'sql',
-    '.md': 'markdown', '.php': 'php', '.pl': 'perl', '.go': 'go', '.ps1': 'powershell',
+    '.md': 'markdown', '.pl': 'perl', '.go': 'go', '.ps1': 'powershell',
     '.conf': 'properties', '.ini': 'properties', '.cnf': 'properties',
     '.service': 'properties', '.properties': 'properties', '.env': 'properties'
   };
@@ -512,7 +536,6 @@
     'sysctl.conf': 'properties', 'rsyslog.conf': 'properties', 'sshd_config': 'properties'
   };
 
-  // 依据文件名猜语法；nginx / dockerfile 这类按文件名优先，其次扩展名、文件名、点开头配置。
   function modeFor(name) {
     var base = String(name).split('/').pop().toLowerCase();
     if (base === 'dockerfile' || base.indexOf('dockerfile.') === 0) return 'dockerfile';
@@ -534,21 +557,81 @@
     return '';
   }
 
+  // 每个语法模式需要先加载的依赖文件（顺序有意义）。
+  //
+  // 混合模式是这里的坑：php 依赖 htmlmixed + clike，htmlmixed 又依赖
+  // xml + javascript + css。缺任何一个，CodeMirror.getMode 都会**静默**退回
+  // null 模式，然后在缩进时抛内部错误（先报 htmlMode.indent is not a function，
+  // 补了 htmlmixed 少 clike 就变成 reading 'prev'），看着就像编辑器坏了。
+  var MODE_DEPS = {
+    htmlmixed: ['xml', 'javascript', 'css', 'htmlmixed'],
+    php: ['clike', 'xml', 'javascript', 'css', 'htmlmixed', 'php']
+  };
+
+  // 同一份脚本只插一次；失败后允许下次重试（瞬时失败不能永久钉死）
+  var modeLoading = {};
+
   function loadScriptOnce(src) {
-    return new Promise(function (resolve, reject) {
+    if (modeLoading[src]) return modeLoading[src];
+    var p = new Promise(function (resolve, reject) {
       var s = document.createElement('script');
+      var done = false;
+      // 没有超时的话，请求一挂住 await 就永不 settle，
+      // 表现和"编辑器打不开"一模一样
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        s.remove();
+        reject(new Error('加载超时 ' + src));
+      }, 8000);
       s.src = src;
-      s.onload = resolve;
-      s.onerror = function () { reject(new Error('加载失败 ' + src)); };
+      s.onload = function () {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      s.onerror = function () {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        s.remove();
+        reject(new Error('加载失败 ' + src));
+      };
       document.head.appendChild(s);
     });
+    p.catch(function () {
+      if (modeLoading[src] === p) delete modeLoading[src];
+    });
+    modeLoading[src] = p;
+    return p;
   }
 
+  // ensureMode 按依赖顺序加载，返回是否**全部就绪**。
+  // 调用方拿到 false 时要退回纯文本，而不是硬套一个残缺模式。
   async function ensureMode(name) {
-    if (!name || loadedModes[name]) return;
-    loadedModes[name] = true;
-    try { await loadScriptOnce('/vendor/codemirror/mode/' + name + '.js'); }
-    catch (e) { /* 没有对应 mode 就当纯文本，不影响编辑 */ }
+    if (!name) return false;
+    if (loadedModes[name] === 'ok') return true;
+
+    var files = MODE_DEPS[name] || [name];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      if (loadedModes[f] === 'ok') continue;
+      try {
+        await loadScriptOnce('/vendor/codemirror/mode/' + f + '.js');
+      } catch (e) {
+        return false; // 不落缓存：下次还能重试
+      }
+      // 脚本"下载成功"不等于模式"注册成功"，必须回头确认 CodeMirror 真的认识它：
+      //   1) -web 模式下 SPA 回退会把 index.html 当 JS 返回（200），onload 照样触发
+      //   2) 有的模式依赖缺 vendor 的 addon（dockerfile 需要 defineSimpleMode），
+      //      执行期抛错但 onload 仍然成功
+      // 不校验的话，这两种情况都会静默变成"没高亮"，而且完全不报错
+      if (!window.CodeMirror.modes[f]) return false;
+      loadedModes[f] = 'ok';
+    }
+    loadedModes[name] = 'ok';
+    return true;
   }
 
   function ensureEditor() {
@@ -585,13 +668,31 @@
       $('file-modal').hidden = false;
 
       var mode = modeFor(entry.name) || modeFromShebang(r.content);
-      await ensureMode(mode);
+      // 依赖没加载齐就退回纯文本：硬套残缺模式会在缩进时抛
+      // "xxx.indent is not a function"，编辑器直接打不开
+      var modeReady = await ensureMode(mode);
+      if (!modeReady) mode = '';
 
       var ed = ensureEditor();
       if (!ed) { window.AwdToast.error('编辑器未能加载'); return; }
-      ed.setOption('mode', mode || null);
+      try {
+        ed.setOption('mode', mode || null);
+      } catch (err) {
+        // 极少数模式下 setOption 仍可能抛，退回纯文本总比打不开强
+        mode = '';
+        ed.setOption('mode', null);
+      }
       ed.setValue(r.content);
       ed.clearHistory();
+
+      // state.editing / state.original 必须等编辑器内容换好之后再赋值。
+      // 提前赋值的话，上面 await ensureMode 的那个窗口里用户按 Ctrl+S，
+      // 保存用的是"新文件路径 + 上一个文件的内容"，会直接把远端新文件覆盖掉。
+      state.editing = entry;
+      state.original = r.content;
+      // 内容就位之后才显示弹窗，避免出现"弹窗里是上一个文件"的错位状态
+      $('file-modal').hidden = false;
+
       setTimeout(function () { ed.refresh(); ed.focus(); }, 40);
       setStatus(mode ? ('编辑 ' + entry.name + '（' + mode + ' 语法高亮）') : ('编辑 ' + entry.name + '（纯文本）'));
     } catch (e) { window.AwdToast.error('打开文件失败\n\n' + e.message); }

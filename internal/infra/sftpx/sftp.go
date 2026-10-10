@@ -82,6 +82,18 @@ func (c *Client) Stat(p string) (Entry, error) {
 	return entryOf(path.Dir(p), fi), nil
 }
 
+// Lstat 取单个路径自身的信息（**不跟随符号链接**）。
+//
+// 与 Stat 的区别在回收站取名这类判断上是决定性的：一个"指向某文件的软链"用 Stat
+// 看会得到目标文件（存在），用 Lstat 才能看出"这个链接名本身是否已被占用"。
+func (c *Client) Lstat(p string) (Entry, error) {
+	fi, err := c.sc.Lstat(p)
+	if err != nil {
+		return Entry{}, fmt.Errorf("读取文件信息失败: %w", err)
+	}
+	return entryOf(path.Dir(p), fi), nil
+}
+
 func entryOf(dir string, fi os.FileInfo) Entry {
 	e := Entry{
 		Name:    fi.Name(),
@@ -109,9 +121,19 @@ func (c *Client) Mkdir(p string) error {
 
 // Remove 删除文件或空目录；目录递归删除由调用方决定策略。
 func (c *Client) Remove(p string, recursive bool) error {
-	fi, err := c.sc.Stat(p)
+	// 用 **Lstat** 而不是 Stat：Stat 会跟随符号链接，于是一个"指向目录的软链"
+	// 会被当成目录，recursive 时走 RemoveAll —— 删掉的是**链接指向的目录里的东西**，
+	// 而用户想删的只是那个链接。Lstat 只看链接本身。
+	fi, err := c.sc.Lstat(p)
 	if err != nil {
 		return fmt.Errorf("路径不存在: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		// 符号链接本身就是个文件条目：直接删链接，递归标志对它无意义
+		if err := c.sc.Remove(p); err != nil {
+			return fmt.Errorf("删除符号链接失败: %w", err)
+		}
+		return nil
 	}
 	if fi.IsDir() {
 		if recursive {

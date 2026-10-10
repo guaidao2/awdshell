@@ -11,7 +11,8 @@
     { area: 'settings-area', btn: 'btn-settings' },
     { area: 'logscan-area', btn: 'btn-logscan' },
     { area: 'compliance-area', btn: 'btn-compliance' },
-    { area: 'threat-area', btn: 'btn-threat' }
+    { area: 'threat-area', btn: 'btn-threat' },
+    { area: 'database-area', btn: 'btn-database' }
   ];
 
   function $(id) { return document.getElementById(id); }
@@ -98,7 +99,7 @@
   // 为什么需要它：跟随时一切正常，但用户一旦手动选过目标就会锁定，之后切会话
   // 视图不再跟着换 —— 而界面上毫无提示，看起来就像坏了。把状态显出来，
   // 并且给出恢复跟随的入口。
-  function followButton(btnId, followActive, label) {
+  function followButton(btnId, followActive, label, onRestore) {
     var el = document.getElementById(btnId);
     if (!el) return;
     var what = label || '本视图目标';
@@ -106,10 +107,14 @@
       el.textContent = '跟随会话';
       el.className = 'awd-follow on';
       el.title = what + '跟随当前终端会话';
+      el.onclick = null;
     } else {
       el.textContent = '已锁定 · 点此跟随';
       el.className = 'awd-follow off';
       el.title = '你手动选过目标，' + what + '已锁定；点一下恢复跟随当前会话';
+      // 用 onclick 赋值而不是 addEventListener：本函数每次渲染都会调用，
+      // 用后者会持续累积监听
+      el.onclick = onRestore || null;
     }
   }
 

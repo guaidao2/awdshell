@@ -54,8 +54,9 @@
     el.className = isError ? 'ls-hint error-text' : 'ls-hint';
   }
 
-  async function req(path) {
-    var res = await fetch(API + path, { headers: { 'Content-Type': 'application/json' } });
+  async function req(path, init) {
+    var opt = Object.assign({ headers: { 'Content-Type': 'application/json' } }, init || {});
+    var res = await fetch(API + path, opt);
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
       try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 忽略 */ }
@@ -173,6 +174,8 @@
       if (c.source_ip) meta.push('来源 ' + c.source_ip);
       if (c.failures) meta.push('失败 ' + c.failures + ' 次');
       if (c.successes) meta.push('成功 ' + c.successes + ' 次');
+      // first_line/last_line 不在这里单独 esc：整段 meta 最后会 esc 一次
+      //（单独 esc 会变成 &amp;lt; 这种双重转义，显示成字面量的 &lt;）
       if (c.first_line) meta.push('行 ' + c.first_line + (c.last_line && c.last_line !== c.first_line ? '-' + c.last_line : ''));
       return '<div class="ls-corr ' + esc(c.severity) + '">' +
         '<div class="ls-corr-head">' +
@@ -202,7 +205,7 @@
         '<div class="ls-hit-head">' +
         '  <span class="sev ' + esc(h.severity) + '">' + esc(sevLabel(h.severity)) + '</span>' +
         '  <span class="rule">' + esc(h.rule_id) + ' · ' + esc(h.rule_name) + '</span>' +
-        '  <span class="meta">行 ' + h.line_no +
+        '  <span class="meta">行 ' + esc(h.line_no) +
         (h.source_ip ? ' · ' + esc(h.source_ip) : '') +
         (h.time ? ' · ' + esc(h.time) : '') +
         (h.decoded ? '  <span class="dec-tag" title="原文没有命中，是解码/去混淆之后才发现的，通常意味着对方刻意混淆过">变形后命中</span>' : '') +
@@ -247,6 +250,10 @@
       state.targetId = '';
       state.result = null;
       state.files = [];
+      state.path = '';
+      // 同一类问题：目标没了，下拉里不能留着它上次的文件名
+      if ($('ls-path')) $('ls-path').value = '';
+      renderFiles();
     }
     if (!state.targetId && state.targets.length) state.targetId = state.targets[0].id;
     renderTargets();
@@ -268,7 +275,7 @@
 
   // 把检测结果导成 CSV。命中行和跨行关联结论一起导出，
   // 关联结论（爆破成功之类）往往才是真正要看的东西。
-  function exportCSV() {
+  async function exportCSV() {
     var res = state.result;
     if (!res || (!(res.hits || []).length && !(res.correlations || []).length)) {
       hint('先跑一次检测，再导出', true);
@@ -291,17 +298,16 @@
     });
 
     // 加 BOM，否则 Excel 打开中文会乱码
-    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = '日志检测-' + String(state.path || 'log').replace(/[^\w.-]/g, '_') + '-' +
+    var fname = '日志检测-' + String(state.path || 'log').replace(/[^\w.-]/g, '_') + '-' +
       new Date().toISOString().slice(0, 10) + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
-    hint('已导出 ' + lines.length - 1 + ' 条记录');
+    try {
+      // 统一走保存出口：配了默认下载目录就落到那里，否则退回浏览器下载
+      if (!window.AwdSaveFile) throw new Error('保存入口没加载，刷新一下页面');
+      var saved = await window.AwdSaveFile(fname, '\ufeff' + lines.join('\r\n'), 'text/csv;charset=utf-8');
+      hint(saved ? ('已保存到 ' + saved) : ('已导出 ' + (lines.length - 1) + ' 条记录'));
+    } catch (e) {
+      hint('保存失败：' + e.message, true);
+    }
   }
 
   function csvCell(v) {
@@ -318,9 +324,10 @@
     hint('正在读取并检测最近 ' + state.lines + ' 行…');
     setStatus('日志检测中：' + state.path);
     try {
+      // 扫描会往 scan_events 写事件，后端只接受 POST；参数都在 query 里，body 为空
       var res = await req('/api/logs/scan?target_id=' + encodeURIComponent(state.targetId) +
         '&path=' + encodeURIComponent(state.path) + '&lines=' + state.lines +
-        '&kind=' + encodeURIComponent(state.kind));
+        '&kind=' + encodeURIComponent(state.kind), { method: 'POST' });
       renderResult(res);
       var kindLabel = res.kind === 'web' ? 'Web 日志规则集' : (res.kind === 'system' ? '系统日志规则集' : '全量规则集');
       hint('检测完成：' + kindLabel + '（' + res.rule_count + ' 条规则' + (res.kind_auto ? '，类型为自动判断' : '，类型为手动指定') +
@@ -363,6 +370,12 @@
     state.result = null;
     state.files = [];
     state.path = '';
+    // 光清 state 不清下拉是错的：下拉里还列着上一台主机的文件名，
+    // 用户这时点「开始检测」就是拿**新目标 + 旧路径**发 POST。
+    // 同时把手动路径输入框一起清掉，否则 renderFiles 里"用户手填过就不覆盖"
+    // 的判断会让旧路径继续留在框里。
+    if ($('ls-path')) $('ls-path').value = '';
+    renderFiles();
     renderTargets();
     return true;
   }
@@ -384,10 +397,20 @@
       if (d.targetId !== state.targetId) return;
       var remaining = d.remainingTargets || [];
       if (remaining.indexOf(state.targetId) >= 0) return;
-      area.hidden = true;
-      $('work-body').style.display = '';
-      var btn = $('btn-logscan');
-      if (btn) btn.classList.remove('active');
+      // 走 AwdViews 收起：自己改 hidden 再无条件把 work-body 的 display 恢复，
+      // 会把此刻开着的别的整页视图一起露出来（叠层）。toggle 同时负责按钮态、
+      // 工作区显隐和监控定时器的重排。
+      if (window.AwdViews && window.AwdViews.isOpen('logscan-area')) {
+        window.AwdViews.toggle('logscan-area');
+        // toggle 收起视图时是无条件恢复工作区的；万一此刻还开着别的整页视图，
+        // 再按回去，否则工作区会和那个视图叠在一起
+        if (window.AwdViews.anyOpen()) $('work-body').style.display = 'none';
+      } else {
+        area.hidden = true;
+        if (!window.AwdViews || !window.AwdViews.anyOpen()) $('work-body').style.display = '';
+        var btn = $('btn-logscan');
+        if (btn) btn.classList.remove('active');
+      }
       setStatus('该目标的会话已全部关闭，日志检测已收起');
     });
     // 目标被新建或删除后重取列表，否则下拉里还是旧数据

@@ -84,6 +84,50 @@
     attachSession: function (id) { return req('/api/sessions/' + encodeURIComponent(id) + '/attach', { method: 'POST' }); }
   };
 
+// 显示 / 清除已记录的主机密钥。
+//
+// 目标机重装或更换密钥后会被拒连，提示里说「在目标的编辑里清除已记录的主机密钥」——
+// 这个入口以前只有后端接口、界面上没有，结果用户按提示找不到地方，
+// 删掉目标重建也没用（known_hosts 按 host:port 独立存储，不随目标走）。
+async function renderHostKeyInfo(targetID) {
+  var box = document.getElementById('hostkey-box');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'hostkey-box';
+    box.className = 'hostkey-box';
+    var anchor = document.getElementById('wrap-password');
+    if (!anchor || !anchor.parentNode) return;
+    anchor.parentNode.insertBefore(box, anchor);
+  }
+  box.innerHTML = '';
+  if (!targetID) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = '<span class="hint">读取已记录的主机密钥…</span>';
+  try {
+    var r = await req('/api/hostkeys?target_id=' + encodeURIComponent(targetID));
+    if (!r.host_key) {
+      box.innerHTML = '<span class="hint">还没有记录这台主机的主机密钥（首次连接时会记录）。</span>';
+      return;
+    }
+    var hk = r.host_key;
+    box.innerHTML =
+      '<div class="hostkey-line"><span>主机密钥</span><code>' + esc(hk.fingerprint) + '</code></div>' +
+      '<div class="hostkey-line"><span>类型</span><code>' + esc(hk.key_type) + '</code></div>' +
+      '<button id="hostkey-forget" class="danger">清除已记录的主机密钥</button>' +
+      '<p class="hint">对端重装系统或更换密钥后指纹会变，连接会被拒绝；确认无误再清除，下次连接按新指纹重新记录。</p>';
+    document.getElementById('hostkey-forget').addEventListener('click', async function () {
+      if (!window.confirm('确定清除已记录的主机密钥？下次连接会按新指纹重新记录。')) return;
+      try {
+        await req('/api/hostkeys/forget', { method: 'POST', body: JSON.stringify({ target_id: targetID }) });
+        window.AwdToast.ok('已清除，下次连接会重新记录');
+        renderHostKeyInfo(targetID);
+      } catch (e) { window.AwdToast.error('清除失败：' + e.message); }
+    });
+  } catch (e) {
+    box.innerHTML = '<span class="hint error-text">读取主机密钥失败：' + esc(e.message) + '</span>';
+  }
+}
+
   async function refreshAll() {
     // 目标列表走共享缓存（targets.js），各视图读到的是同一份
     var r = await Promise.all([targets(), api.recent(), api.history()]);
@@ -100,18 +144,28 @@
       var r = await Promise.all([api.recent(), api.history()]);
       state.recent = r[0] || []; state.history = r[1] || [];
       renderSidebar();
-    } catch (e) { /* 忽略 */ }
+    } catch (e) {
+      // 原来是空 catch：连接历史刷不出来时界面毫无反应，看着像"点了没生效"
+      setStatus('刷新连接历史失败：' + e.message);
+    }
   }
 
   // ---------------- 侧栏 ----------------
+
+  // 标签列表的统一取值：后端把 tags 给成 null、字符串或对象时，
+  // 后面那串 .some / .map / .join 都会当场抛错，这里先收成数组
+  function tagList(t) {
+    return (t && Array.isArray(t.tags)) ? t.tags : [];
+  }
 
   function filteredTargets() {
     var k = state.keyword.trim().toLowerCase();
     if (!k) return state.targets;
     return state.targets.filter(function (t) {
-      return t.name.toLowerCase().indexOf(k) >= 0 ||
-        t.host.toLowerCase().indexOf(k) >= 0 ||
-        (t.tags || []).some(function (x) { return x.toLowerCase().indexOf(k) >= 0; });
+      var tags = tagList(t);
+      return String(t.name || '').toLowerCase().indexOf(k) >= 0 ||
+        String(t.host || '').toLowerCase().indexOf(k) >= 0 ||
+        tags.some(function (x) { return String(x == null ? '' : x).toLowerCase().indexOf(k) >= 0; });
     });
   }
 
@@ -134,7 +188,7 @@
       return '<li data-act="connect" data-id="' + esc(t.id) + '" class="' + (state.activeTarget === t.id ? 'active' : '') + '">' +
         '<span class="dot"></span><span class="name">' + esc(t.name) + '</span>' +
         '<span class="addr">' + esc(t.username) + '@' + esc(t.host) + ':' + esc(t.port) + '</span>' +
-        ((t.tags && t.tags.length) ? '<span class="tags">' + t.tags.map(function (x) { return esc(x); }).join(' · ') + '</span>' : '') +
+        ((tagList(t).length) ? '<span class="tags">' + tagList(t).map(function (x) { return esc(x); }).join(' · ') + '</span>' : '') +
         '<span class="row-actions">' +
         '<button data-act="edit" data-id="' + esc(t.id) + '">编辑</button>' +
         '<button data-act="test" data-id="' + esc(t.id) + '">测试</button>' +
@@ -147,7 +201,11 @@
     html += '</ul></section>';
 
     if (state.history.length) {
-      html += '<section><h4>连接历史<span class="count">' + state.history.length + '</span></h4><ul class="history-list">';
+      // 连接历史也给了清空入口：这张表以前只能等后台按保留期清理，
+      // 用户没有任何办法清掉自己的连接流水
+      html += '<section><h4>连接历史<span class="count">' + state.history.length + '</span>' +
+        '<button class="mini-btn" data-act="clear-history" title="清空全部连接历史">清空</button>' +
+        '</h4><ul class="history-list">';
       html += state.history.slice(0, 40).map(function (h) {
         return '<li data-act="reconnect" data-id="' + esc(h.target_id || '') + '">' +
           '<span class="name">' + esc(h.name || h.host) + '</span>' +
@@ -164,6 +222,27 @@
   function renderStats() {
     el.statSessions.textContent = state.sessions.length + ' 个会话';
     el.statTargets.textContent = state.targets.length + ' 台目标';
+  }
+
+  // 清空连接历史。以前只有后台按保留期清理这一条路，
+  // 用户想清掉自己的连接流水没有任何办法。
+  async function clearHistory() {
+    if (!state.history.length) return;
+    // 不报条数：界面只取了前 200 条、只渲染前 40 条，
+    // 报出来的数跟库里实际要删的对不上，反而误导
+    if (!window.confirm('清空全部连接历史？这个动作不可撤销。')) return;
+    try {
+      var r = await req('/api/history', {
+        method: 'POST',
+        body: JSON.stringify({ all: true })
+      });
+      state.history = [];
+      renderSidebar();
+      if (window.AwdToast) window.AwdToast.ok('已清空 ' + (r.deleted || 0) + ' 条连接历史');
+      setStatus('连接历史已清空');
+    } catch (e) {
+      if (window.AwdToast) window.AwdToast.error('清空连接历史失败\n\n' + e.message);
+    }
   }
 
   // ---------------- 标签与终端 ----------------
@@ -360,7 +439,14 @@
   function openWS(s, token) {
     var ws = new WebSocket(WS_BASE + '/ws/term/' + s.id + '?token=' + encodeURIComponent(token));
     ws.binaryType = 'arraybuffer';
+    // 先占位、再关旧的：这样旧 socket 迟到的 onclose 会因 `s.ws !== ws` 被忽略，
+    // 不会再去拉一条重连链（同一会话两个 WebSocket 会让终端输出交错，
+    // 而且服务端令牌是一次性的，第二次 attach 会把第一次的作废）。
+    var old = s.ws;
     s.ws = ws;
+    if (old && old !== ws) {
+      try { old.close(); } catch (e) { /* 忽略 */ }
+    }
     s.warnedClosed = false;
 
     ws.onopen = function () {
@@ -370,6 +456,11 @@
       safeFit(s);
     };
     ws.onmessage = function (ev) {
+      // 这个 socket 已经被新的替换掉了：迟到的消息必须和 onclose 一样直接忽略。
+      // 少了这道守卫时，旧 socket 迟来的一条 exit 会把**新**连接中的会话标成
+      // state='closed' + gaveUp=true（标签显示"连接已结束"），而且新 socket 后续的
+      // onclose 会被 gaveUp 挡掉 —— 那个标签此后不再自动重连。
+      if (s.ws !== ws) return;
       if (typeof ev.data === 'string') {
         try {
           var m = JSON.parse(ev.data);
@@ -379,6 +470,9 @@
             s.gaveUp = true; // shell 正常退出，不必重连
             renderTabs();
             setStatus(s.title + ' 会话已结束（这个标签已断开，可直接关闭）');
+            // 主动关掉 WS：服务端 handler 没有读超时，不关的话它会一直
+            // 阻塞在 ReadMessage，每个自然退出的会话都留一个 goroutine 和一条连接
+            try { ws.close(); } catch (e) { /* 忽略 */ }
           }
         } catch (e) { /* 忽略 */ }
         return;
@@ -386,6 +480,10 @@
       s.term.write(new Uint8Array(ev.data));
     };
     ws.onclose = function () {
+      // 这个 socket 已经被新的替换掉了：迟到的 onclose 必须直接忽略。
+      // 没有这道守卫时，重连链里 `s.reconnecting` 会在 openWS 之前就置回 false，
+      // 于是旧 socket 的 onclose 再拉一条链 —— 同一会话出现两个 WebSocket。
+      if (s.ws !== ws) return;
       if (s.gaveUp || s.closing) return;
       s.state = 'closed';
       renderTabs();
@@ -440,6 +538,44 @@
     return s ? s.targetId : '';
   };
 
+  // 统一的"导出一份文件"出口。
+  //
+  // 配了默认下载目录就走后端直接落盘 —— 浏览器下载只能落到系统默认下载目录，
+  // 用户选不了地方，对运维来说很别扭（报告要交给别人、CSV 要接着处理）。
+  // 没配目录就退回浏览器下载，保持和以前一样的行为。
+  //
+  // 返回：走后端时是保存到的完整路径；走浏览器时是 null。
+  window.AwdSaveFile = async function (name, content, mime) {
+    var dir = (window.AWD_SETTINGS && window.AWD_SETTINGS.download_dir) || '';
+    if (dir) {
+      try {
+        var r = await req('/api/system/save-file', {
+          method: 'POST',
+          body: JSON.stringify({ name: name, content: content })
+        });
+        return r.saved_to || null;
+      } catch (e) {
+        // 后端这里会因为"没配默认下载目录 / 目录不可写"回 400。
+        // 原来异常直接冒到调用方，用户看到的是"保存失败：没有配置默认下载目录"，
+        // 而注释里承诺过"没配目录就退回浏览器下载" —— 那条路必须真的走通。
+        if (window.AwdToast) {
+          window.AwdToast.warn('后端保存失败（' + e.message + '），已改为浏览器下载。\n\n' +
+            '想让文件直接落到指定目录，去「设置」里填默认下载目录。');
+        }
+      }
+    }
+    var blob = new Blob([content], { type: mime || 'application/octet-stream' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+    return null;
+  };
+
   function safeFit(s) {
     try { s.fit.fit(); } catch (e) { /* 容器不可见时忽略 */ }
   }
@@ -459,7 +595,10 @@
           window.dispatchEvent(new CustomEvent('awdshell:cwd', { detail: { path: info.path } }));
         }
       }, 500);
-    }).catch(function () { /* 不影响终端使用 */ });
+    }).catch(function (e) {
+      // 原来是空 catch：初始目录读不到时什么提示都没有，用户只看到终端停在别处
+      setStatus('初始目录信息读取失败：' + e.message + '（不影响终端使用）');
+    });
   }
 
   // 单引号安全引用（远端 shell 用）
@@ -629,6 +768,11 @@
     if (state.active === id) {
       var next = state.sessions[i - 1] || state.sessions[i];
       state.active = next ? next.id : '';
+      // 自动切到别的标签时也要广播一次，否则各视图还停在被关掉那台上，
+      // 而它们的按钮却显示"跟随会话"，看起来就像跟随坏了
+      if (next) {
+        window.dispatchEvent(new CustomEvent('awdshell:connected', { detail: { targetId: next.targetId } }));
+      }
     }
     renderTabs();
     applyActive();
@@ -648,6 +792,7 @@
       el.f.username.value = t.username; el.f.auth.value = t.auth_kind || 'password';
       el.f.group.value = t.group || ''; el.f.startdir.value = t.start_dir || '';
       if (el.f.tags) el.f.tags.value = (t.tags || []).join(', ');
+      renderHostKeyInfo(id);
       el.f.password.value = ''; el.f.privatekey.value = ''; el.f.passphrase.value = '';
       el.f.password.placeholder = '留空表示不修改已保存的密码';
     } else {
@@ -655,6 +800,7 @@
       el.f.name.value = ''; el.f.host.value = ''; el.f.port.value = 22;
       el.f.username.value = 'root'; el.f.auth.value = 'password'; el.f.group.value = ''; el.f.startdir.value = '';
       if (el.f.tags) el.f.tags.value = '';
+      renderHostKeyInfo('');
       el.f.password.value = ''; el.f.privatekey.value = ''; el.f.passphrase.value = '';
       el.f.password.placeholder = '';
     }
@@ -796,7 +942,7 @@
       var k = el.search.value.trim().toLowerCase();
       var first = state.targets.filter(function (t) {
         if (!k) return true;
-        return (t.name + ' ' + t.host + ' ' + (t.tags || []).join(' ')).toLowerCase().indexOf(k) >= 0;
+        return (String(t.name || '') + ' ' + String(t.host || '') + ' ' + tagList(t).join(' ')).toLowerCase().indexOf(k) >= 0;
       })[0];
       if (first) connect(first.id);
       else setStatus('没有匹配的主机');
@@ -835,6 +981,7 @@
       else if (act === 'test') testTarget(id);
       else if (act === 'delete') removeTarget(id);
       else if (act === 'reconnect') reconnect(id);
+      else if (act === 'clear-history') clearHistory();
     });
 
     el.tabs.addEventListener('click', function (e) {
@@ -862,7 +1009,9 @@
     try {
       window.AWD_SETTINGS = await req('/api/settings');
     } catch (e) {
-      /* 用默认值 */
+      // 用默认值本身没错，但必须说出来：设置读不到时用户改字号、改下载目录
+      // 都没反应（包括导出会因此退回浏览器下载），不说就像界面坏了
+      if (window.AwdToast) window.AwdToast.warn('读取设置失败，已用默认值：' + e.message);
     }
     try {
       await refreshAll();

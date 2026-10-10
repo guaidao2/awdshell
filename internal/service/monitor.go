@@ -13,6 +13,13 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// sampleInterval 是首次采样时两次取样的间隔。
+//
+// 为什么要等：CPU 占用与网络速率都是**两次采样的差值**，第一次没有基准，
+// 界面上会是一片 0；等 400ms 再采一次，一打开页面就有真实数字。
+// 代价是首次采样慢 400ms —— 这个数字是"够采到真实间隔"与"用户感觉不到卡"的折中。
+var sampleInterval = 400 * time.Millisecond
+
 // MonitorService 采集目标主机的资源指标（走连接池里的同一条 SSH 连接）。
 type MonitorService struct {
 	targets *TargetService
@@ -21,6 +28,15 @@ type MonitorService struct {
 	mu     sync.Mutex
 	last   map[string]collect.Snapshot
 	lastAt map[string]time.Time
+
+	// sampleMu 把同一目标的采样串起来。
+	//
+	// 为什么需要：监控面板刷新、切目标、手动点刷新都可能并发调 Sample，
+	// 而 CPU/速率全靠 last 与 lastAt 当基准 —— 两次并发采样会各自覆盖同一份
+	// 基准，算出来的百分比没有意义（差值区间与时间区间对不上）。
+	// 用 TryLock 而不是 Lock：并发时后到的那次直接返回"正在采样"，
+	// 而不是排队再采一遍（排队只会让界面更慢，数字也不会更准）。
+	sampleMu sync.Mutex
 }
 
 // NewMonitorService 构造服务。
@@ -56,10 +72,11 @@ type NameCount struct {
 
 // Metric 是一次采样的结果，直接给 UI 用。
 type Metric struct {
-	TargetID   string              `json:"target_id"`
-	TS         int64               `json:"ts"`
-	CPUPercent float64             `json:"cpu_percent"`
-	CPUCores   []CoreUsage         `json:"cpu_cores"`
+	TargetID   string      `json:"target_id"`
+	TS         int64       `json:"ts"`
+	CPUPercent float64     `json:"cpu_percent"`
+	CPUCores   []CoreUsage `json:"cpu_cores"`
+	// ProcTotal 是进程总数；**-1 表示没采到**（不是 0 个进程）。
 	ProcTotal  int                 `json:"proc_total"`
 	MemBuffers uint64              `json:"mem_buffers"`
 	MemCached  uint64              `json:"mem_cached"`
@@ -85,10 +102,25 @@ type Metric struct {
 	Procs      []collect.ProcInfo  `json:"procs"`
 	Listeners  []collect.Listener  `json:"listeners"`
 	First      bool                `json:"first"` // 首次采样（CPU/速率还没有基准）
+
+	// Collected=false 表示关键段（/proc/stat 的 CPU、/proc/meminfo）没采到。
+	// 前端据此把面板标成"未采集到"，而不是画成 CPU 0% / 内存 0% ——
+	// 后者看起来像一台正常空闲的机器，那是**错误数据**而不是缺失数据。
+	Collected bool     `json:"collected"`
+	Missing   []string `json:"missing"`
+
+	// Problems 是"脚本说采到了、但解析端没提出东西"的说明（人话）。
+	// 前端拿到非空时应当提示"这一段的数据可能不完整"，而不是把空列表当真。
+	Problems []string `json:"problems"`
 }
 
 // Sample 采集一次；首次调用会补采一次以便算出 CPU 占用与网络速率。
 func (s *MonitorService) Sample(targetID string) (Metric, error) {
+	if !s.sampleMu.TryLock() {
+		return Metric{}, fmt.Errorf("上一次采样还没结束，请稍候再试")
+	}
+	defer s.sampleMu.Unlock()
+
 	snap, err := s.rawSample(targetID)
 	if err != nil {
 		return Metric{}, err
@@ -103,19 +135,33 @@ func (s *MonitorService) Sample(targetID string) (Metric, error) {
 
 	// 首次没有基准：等一小会再采一次，这样界面一打开就有真实数字。
 	if !hadPrev {
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(sampleInterval)
 		second, err2 := s.rawSample(targetID)
 		if err2 == nil {
 			s.mu.Lock()
 			s.last[targetID] = second
 			s.lastAt[targetID] = time.Now()
 			s.mu.Unlock()
-			prev, prevAt, hadPrev = snap, time.Now().Add(-400*time.Millisecond), true
+			prev, prevAt, hadPrev = snap, time.Now().Add(-sampleInterval), true
 			snap = second
 		}
 	}
 
 	return buildMetric(targetID, snap, prev, prevAt, hadPrev), nil
+}
+
+// Forget 忘掉某个目标的采样基准。
+//
+// 为什么必须清：s.last 里存的是上一次的 CPU 时间片与网卡累计字节，
+// 目标删掉（或它的连接/凭据改了）之后这份数据不该继续留着 ——
+// 同一个 targetID 被重新添加回来时，会拿一个陈旧的基准去算 CPU 与速率，
+// 差值区间可能横跨几小时，画出来的百分比是假的。
+// 由 TargetService.Delete 通过钩子调用（见 MonitorService.Forget 的接线）。
+func (s *MonitorService) Forget(targetID string) {
+	s.mu.Lock()
+	delete(s.last, targetID)
+	delete(s.lastAt, targetID)
+	s.mu.Unlock()
 }
 
 // rawSample 执行采集脚本并解析。
@@ -133,7 +179,11 @@ func (s *MonitorService) rawSample(targetID string) (collect.Snapshot, error) {
 	}
 	out, err := sshx.RunOutput(conn, collect.Script, 15*time.Second)
 	if err != nil {
-		s.pool.Drop(key)
+		// 采集脚本里某条命令失败不算连接坏（脚本自己会 2>/dev/null 兜底），
+		// 只有连接类错误才丢弃共享连接，否则会连带掐断终端
+		if sshx.IsConnError(err) {
+			s.pool.DropIf(key, conn) // 按身份删，别误删别人刚换上的那条
+		}
 		return collect.Snapshot{}, fmt.Errorf("采集失败: %w", err)
 	}
 	return collect.Parse(out), nil
@@ -152,6 +202,16 @@ func buildMetric(targetID string, snap, prev collect.Snapshot, prevAt time.Time,
 		Procs:     snap.Procs,
 		Listeners: snap.Listeners,
 		First:     !hadPrev,
+		Collected: snap.Collected,
+		Missing:   snap.Missing,
+		Problems:  snap.Problems,
+	}
+
+	if m.Missing == nil {
+		m.Missing = []string{}
+	}
+	if m.Problems == nil {
+		m.Problems = []string{}
 	}
 
 	// CPU：两次 /proc/stat 的差值
@@ -175,7 +235,15 @@ func buildMetric(targetID string, snap, prev collect.Snapshot, prevAt time.Time,
 		}
 		m.CPUCores = append(m.CPUCores, item)
 	}
-	m.ProcTotal = snap.ProcTotal
+	// 进程总数：**没数出来时给 -1，不给 0**。
+	//
+	// 0 在这件事上是有意义的数字（"这台机器没有进程"），而 BusyBox 上
+	// `ps -e --no-headers` 失败、`wc -l` 照样给 0 —— 界面会把一个假的 0
+	// 画成"0 个进程"。用 -1 表达"没采到"，前端据此显示"—"或"未采集到"。
+	m.ProcTotal = -1
+	if snap.ProcTotalValid {
+		m.ProcTotal = snap.ProcTotal
+	}
 	m.MemBuffers = snap.Mem["Buffers"] * 1024
 	m.MemCached = snap.Mem["Cached"] * 1024
 	m.OSName = snap.OSName

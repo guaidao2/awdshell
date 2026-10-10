@@ -38,7 +38,7 @@ func New(dataDir string) (*Vault, error) {
 		if _, err := rand.Read(key); err != nil {
 			return nil, fmt.Errorf("生成密钥失败: %w", err)
 		}
-		if err := os.WriteFile(keyPath, key, 0o600); err != nil {
+		if err := writeKeyFile(keyPath, key); err != nil {
 			return nil, fmt.Errorf("写入密钥失败: %w", err)
 		}
 	} else if err != nil {
@@ -53,6 +53,39 @@ func New(dataDir string) (*Vault, error) {
 		return nil, fmt.Errorf("初始化 AEAD 失败: %w", err)
 	}
 	return &Vault{aead: aead, keyPath: keyPath}, nil
+}
+
+// writeKeyFile **原子**写入密钥文件。
+//
+// 不能直接 WriteFile：写一半断电/崩溃会留下长度不合法的 key.bin，
+// 下次启动 `New` 直接报"密钥长度非法" —— 用户看到的是"程序打不开、数据全丢"。
+// 先写同目录的临时文件、fsync、再改名：任何时刻 key.bin 要么是旧的完整内容，
+// 要么是新的完整内容，不会出现半截。
+func writeKeyFile(path string, key []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(key); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // KeyPath 返回密钥文件路径（供诊断展示）。

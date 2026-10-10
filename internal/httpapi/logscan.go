@@ -17,6 +17,10 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	switch action {
 	case "files":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		files, err := s.Logs.ListLogFiles(targetID)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err)
@@ -25,6 +29,11 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, files)
 
 	case "scan":
+		// 扫描会往 scan_events 写事件，属于写操作，限 POST
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		lines := 2000
 		if v := r.URL.Query().Get("lines"); v != "" {
 			fmt.Sscanf(v, "%d", &lines)

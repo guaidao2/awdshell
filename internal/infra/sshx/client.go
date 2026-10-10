@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/guaidao2/awdshell/internal/domain"
@@ -29,10 +30,25 @@ type HostKeyVerifier interface {
 }
 
 // verifier 由上层在启动时注入，避免每个调用点都要多传一个参数。
-var verifier HostKeyVerifier
+// 用 RWMutex 护住：注入发生在启动期，握手在各采集/终端 goroutine 里读。
+var (
+	verifierMu sync.RWMutex
+	verifier   HostKeyVerifier
+)
 
 // SetHostKeyVerifier 注入主机密钥校验器。
-func SetHostKeyVerifier(v HostKeyVerifier) { verifier = v }
+func SetHostKeyVerifier(v HostKeyVerifier) {
+	verifierMu.Lock()
+	verifier = v
+	verifierMu.Unlock()
+}
+
+// getVerifier 读当前校验器。
+func getVerifier() HostKeyVerifier {
+	verifierMu.RLock()
+	defer verifierMu.RUnlock()
+	return verifier
+}
 
 // Dial 建立一条 SSH 连接。
 func Dial(host string, port int, auth Auth, timeout time.Duration) (*ssh.Client, error) {
@@ -48,13 +64,8 @@ func Dial(host string, port int, auth Auth, timeout time.Duration) (*ssh.Client,
 		Auth: methods,
 		// 主机密钥必须校验：不校验的话中间人可以无感接管，凭据与后续所有操作都会暴露。
 		// 首次连接按 accept-new 记录指纹，之后必须一致；不一致直接拒绝连接。
-		HostKeyCallback: func(h string, remote net.Addr, key ssh.PublicKey) error {
-			if verifier == nil {
-				return nil
-			}
-			return verifier.Check(host, port, key)
-		},
-		Timeout: timeout,
+		HostKeyCallback: hostKeyCallback(host, port),
+		Timeout:         timeout,
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	client, err := ssh.Dial("tcp", addr, cfg)
@@ -62,6 +73,21 @@ func Dial(host string, port int, auth Auth, timeout time.Duration) (*ssh.Client,
 		return nil, fmt.Errorf("连接 %s 失败: %w", addr, err)
 	}
 	return client, nil
+}
+
+// hostKeyCallback 造出校验主机密钥的回调（单独拎出来是为了能直接测 fail-closed）。
+func hostKeyCallback(host string, port int) ssh.HostKeyCallback {
+	return func(h string, remote net.Addr, key ssh.PublicKey) error {
+		// fail-closed：没有校验器就**拒绝连接**，而不是放行。
+		// 以前这里是 `if verifier == nil { return nil }` —— 与上一行的注释
+		// 正相反，等于开了一个静默的无校验口子（当前 main 已注入，所以不可达；
+		// 但任何新的调用路径忘了注入，中间人就能无感接管这条连接）。
+		v := getVerifier()
+		if v == nil {
+			return errors.New("主机密钥校验器未注入，拒绝连接（fail-closed）")
+		}
+		return v.Check(host, port, key)
+	}
 }
 
 func authMethods(auth Auth) ([]ssh.AuthMethod, error) {

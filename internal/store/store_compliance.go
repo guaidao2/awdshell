@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"sync"
 	"time"
 )
 
@@ -27,38 +26,52 @@ type ComplianceReport struct {
 	Results   json.RawMessage `json:"results"` // 完整结果，供回看与对比
 }
 
-var complianceOnce sync.Once
-var complianceErr error
+// ensureComplianceReports 现在是空操作，保留只为不动调用点。
+//
+// 建表已经挪到 store.Open 执行的 schema 常量里（跟其它表一样，
+// 每次 Open 都跑 CREATE TABLE IF NOT EXISTS）。
+//
+// 原来这里挂着包级 sync.Once，scope 是"进程"而不是"这个库"：
+// 同一进程里打开第二个库时建表不会执行，SaveComplianceReport 会报
+// "no such table: compliance_reports"。单实例时看不出来，是潜伏问题。
+func (s *Store) ensureComplianceReports() error { return nil }
 
-func (s *Store) ensureComplianceReports() error {
-	complianceOnce.Do(func() {
-		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS compliance_reports (
-				id         INTEGER PRIMARY KEY AUTOINCREMENT,
-				ts         INTEGER NOT NULL,
-				target_id  TEXT NOT NULL DEFAULT '',
-				target     TEXT NOT NULL DEFAULT '',
-				score      INTEGER NOT NULL DEFAULT 0,
-				total      INTEGER NOT NULL DEFAULT 0,
-				pass       INTEGER NOT NULL DEFAULT 0,
-				fail       INTEGER NOT NULL DEFAULT 0,
-				manual     INTEGER NOT NULL DEFAULT 0,
-				err_count  INTEGER NOT NULL DEFAULT 0,
-				elapsed_ms INTEGER NOT NULL DEFAULT 0,
-				results    TEXT NOT NULL DEFAULT ''
-			)`,
-			`CREATE INDEX IF NOT EXISTS idx_compliance_ts ON compliance_reports(ts)`,
-			`CREATE INDEX IF NOT EXISTS idx_compliance_target ON compliance_reports(target_id)`,
-		}
-		for _, q := range stmts {
-			if _, err := s.db.Exec(q); err != nil {
-				complianceErr = err
-				return
-			}
-		}
-	})
-	return complianceErr
-}
+// complianceTSMigration 把老库里的秒级时间戳刷成毫秒。
+//
+// 老版本（v0.1.0 及更早）这里是 `time.Now().Unix()`，而全项目统一用毫秒。
+// 必须在**写侧**迁移，只靠读侧的 normalizeTS 不够：
+//   - PruneComplianceReports 是拿原始 ts 和毫秒 before 在 SQL 里比大小的，
+//     秒级行会被当成"1970 年的过期数据"直接删掉；
+//   - ORDER BY ts DESC 也会把秒级行永远排在最后。
+//
+// 条件用**固定范围**而不是"小于某个量级"，也不用"现在+1天"这种依赖时钟的上界：
+//
+//	下界 946684800  = 2000-01-01 的秒值（本项目 2026 年才有数据，不会更早）
+//	上界 4102444800 = 2100-01-01 的秒值
+//
+// 毫秒值都 >= 1e12，天然落在这个区间之外，不会被重复乘。
+// 不用"现在+86400"是因为机器时钟偏移超过一天时，那些老记录会被漏掉迁移，
+// 之后被保留期清理当成 1970 年的数据删掉。
+// 幂等：换算后不再满足条件。
+const complianceTSMigration = `UPDATE compliance_reports SET ts = ts * 1000
+	WHERE ts >= 946684800 AND ts < 4102444800`
+
+// hostKeyTSMigration 把老库 known_hosts 里的**秒级**时间戳刷成毫秒。
+//
+// 写侧已经是 UnixMilli（见 SaveHostKey），但升级上来的老库里 first_seen /
+// last_seen 还是秒值（实测 first_seen=1791544791，按毫秒解释是 1970-01-21）。
+// 读侧没有 normalizeTS，所以必须在写侧一次性迁移。
+//
+// 判据与 complianceTSMigration 完全一致（同为秒值区间），幂等：换算成毫秒后
+// 都 >= 1e12，天然落在这个区间之外，不会被重复乘。
+// 两列各自独立判断：只迁移落在秒值区间里的那一列，不去动已经正常的另一列。
+const hostKeyTSMigration = `UPDATE known_hosts SET
+		first_seen = CASE WHEN first_seen >= 946684800 AND first_seen < 4102444800
+			THEN first_seen * 1000 ELSE first_seen END,
+		last_seen  = CASE WHEN last_seen  >= 946684800 AND last_seen  < 4102444800
+			THEN last_seen  * 1000 ELSE last_seen  END
+	WHERE (first_seen >= 946684800 AND first_seen < 4102444800)
+	   OR (last_seen  >= 946684800 AND last_seen  < 4102444800)`
 
 // SaveComplianceReport 保存一次核查报告。
 func (s *Store) SaveComplianceReport(r ComplianceReport) (int64, error) {
@@ -66,7 +79,7 @@ func (s *Store) SaveComplianceReport(r ComplianceReport) (int64, error) {
 		return 0, err
 	}
 	if r.TS == 0 {
-		r.TS = time.Now().Unix()
+		r.TS = time.Now().UnixMilli()
 	}
 	res, err := s.db.Exec(`INSERT INTO compliance_reports
 		(ts, target_id, target, score, total, pass, fail, manual, err_count, elapsed_ms, results)
@@ -83,8 +96,11 @@ func (s *Store) ListComplianceReports(targetID string, limit int) ([]ComplianceR
 	if err := s.ensureComplianceReports(); err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > 200 {
+	if limit <= 0 {
 		limit = 30
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	query := `SELECT id, ts, target_id, target, score, total, pass, fail, manual, err_count, elapsed_ms
 		FROM compliance_reports`
@@ -109,9 +125,22 @@ func (s *Store) ListComplianceReports(targetID string, limit int) ([]ComplianceR
 			&r.Total, &r.Pass, &r.Fail, &r.Manual, &r.Error, &r.ElapsedMs); err != nil {
 			return nil, err
 		}
+		r.TS = normalizeTS(r.TS)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// normalizeTS 把老库里遗留的秒级时间戳归一到毫秒。
+//
+// 毫秒化是在 v0.1.0 之后才统一的，升级上来的库里可能还留着秒级记录：
+// 不归一的话，它们会被保留期清理当成过期数据直接删掉，
+// 或者在前端被当作毫秒显示成 1970 年。
+func normalizeTS(ts int64) int64 {
+	if ts > 0 && ts < 1e11 {
+		return ts * 1000
+	}
+	return ts
 }
 
 // GetComplianceReport 取一次报告的完整内容。
@@ -131,6 +160,7 @@ func (s *Store) GetComplianceReport(id int64) (*ComplianceReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	r.TS = normalizeTS(r.TS)
 	r.Results = json.RawMessage(raw)
 	return &r, nil
 }
@@ -141,6 +171,38 @@ func (s *Store) PruneComplianceReports(before int64) (int64, error) {
 		return 0, err
 	}
 	res, err := s.db.Exec(`DELETE FROM compliance_reports WHERE ts < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// DeleteComplianceReport 删掉一份核查报告，返回实际删掉的行数。
+// 保留期清理是"后台定时"，用户还得能自己删掉某一次跑坏的结论。
+func (s *Store) DeleteComplianceReport(id int64) (int64, error) {
+	if err := s.ensureComplianceReports(); err != nil {
+		return 0, err
+	}
+	res, err := s.db.Exec(`DELETE FROM compliance_reports WHERE id = ?`, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ClearComplianceReports 清空核查报告；targetID 为空表示全部清掉。
+// 返回删掉的条数。
+func (s *Store) ClearComplianceReports(targetID string) (int64, error) {
+	if err := s.ensureComplianceReports(); err != nil {
+		return 0, err
+	}
+	var res sql.Result
+	var err error
+	if targetID == "" {
+		res, err = s.db.Exec(`DELETE FROM compliance_reports`)
+	} else {
+		res, err = s.db.Exec(`DELETE FROM compliance_reports WHERE target_id = ?`, targetID)
+	}
 	if err != nil {
 		return 0, err
 	}

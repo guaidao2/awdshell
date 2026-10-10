@@ -14,7 +14,28 @@ type Terminal struct {
 	stdin   io.WriteCloser
 	output  io.Reader
 
+	// release 是池里那条连接的"长连接引用"释放函数（可能为 nil）。
+	// 有它之后，只要终端还开着，reaper 就不会把这条连接按空闲回收。
+	release   func()
 	closeOnce sync.Once
+}
+
+// StartTerminalHeld 在已有连接上开交互 shell，并在它的整个生命周期里
+// 持有这条池连接的长引用。
+//
+// 为什么需要：reaper 只看 lastUsed，而终端 I/O 走 Terminal、完全不碰池。
+// "只开终端"（或窗口最小化、或长时间不敲键）时 lastUsed 停在开终端那一刻，
+// reaper 会在最后一次 Acquire 后 5~6 分钟把连接关掉 —— 用户正在敲的终端突然断。
+// 实测把 idle 调成 3 秒后，第一个 tick（60 秒）终端即断开、池里连接被摘除。
+func (p *Pool) StartTerminalHeld(client *ssh.Client, cols, rows int, termName string) (*Terminal, error) {
+	release := p.Hold(client)
+	t, err := StartTerminal(client, cols, rows, termName)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	t.release = release
+	return t, nil
 }
 
 // StartTerminal 在已有连接上开一个带 PTY 的 shell。
@@ -83,12 +104,16 @@ func (t *Terminal) Resize(cols, rows int) error {
 // Wait 等待 shell 退出。
 func (t *Terminal) Wait() error { return t.session.Wait() }
 
-// Close 关闭会话。
+// Close 关闭会话，并释放池连接上的长引用。
 func (t *Terminal) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
 		_ = t.stdin.Close()
 		err = t.session.Close()
+		if t.release != nil {
+			t.release()
+			t.release = nil
+		}
 	})
 	return err
 }

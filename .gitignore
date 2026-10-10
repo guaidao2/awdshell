@@ -18,6 +18,8 @@ awdshell-rulec
 *.out
 coverage.txt
 /vendor/
+# 测试在工作区内建的临时目录（见 store_test.go / local_test.go / main_test.go）
+.test-*/
 
 # ---- Node（当前前端为免构建静态资源，保留此规则以备将来引入构建链）----
 node_modules/
@@ -45,3 +47,6 @@ config.local.yaml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# CodeGraph 索引（本地代码图谱，不入库）
+.codegraph/

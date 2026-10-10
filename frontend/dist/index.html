@@ -25,6 +25,7 @@
           <div class="tabs-views">
             <button class="view-btn" id="btn-files" title="在终端右侧显示文件面板">文件面板</button>
             <button class="view-btn" id="btn-monitor" title="在终端右侧显示资源监控">监控</button>
+            <button class="view-btn" id="btn-database" title="通过 SSH 管理目标机上的 MySQL / PostgreSQL">数据库</button>
             <span class="view-sep"></span>
             <button class="view-btn grid-btn active" data-grid="1" title="单屏">▣</button>
             <button class="view-btn grid-btn" data-grid="cols2" title="左右分屏">▥</button>
@@ -48,6 +49,7 @@
         <div class="logscan-area" id="logscan-area" hidden></div>
         <div class="compliance-area" id="compliance-area" hidden></div>
         <div class="threat-area" id="threat-area" hidden></div>
+        <div class="database-area" id="database-area" hidden></div>
 
         <footer class="statusbar">
           <span class="status-text" id="status">就绪</span>
@@ -115,6 +117,7 @@
     <script src="/vendor/codemirror/codemirror.js"></script>
     <script src="/vendor/codemirror/addon/matchbrackets.js"></script>
     <script src="/vendor/codemirror/addon/closebrackets.js"></script>
+    <script src="/vendor/codemirror/addon/mode-simple.js"></script>
     <script src="/vendor/codemirror/addon/active-line.js"></script>
     <script src="/vendor/codemirror/addon/searchcursor.js"></script>
     <script src="/vendor/codemirror/addon/search.js"></script>
@@ -127,6 +130,8 @@
     <script src="/logscan.js"></script>
     <script src="/compliance.js"></script>
     <script src="/threat.js"></script>
+    <script src="/database-table.js"></script>
+    <script src="/database.js"></script>
     <script src="/settings.js"></script>
   </body>
 </html>

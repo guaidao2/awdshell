@@ -91,8 +91,11 @@ func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) 
 	if lines <= 0 || lines > 20000 {
 		lines = 2000
 	}
-	// btmp / wtmp 是 utmp 二进制格式，直接 tail 出来是乱码（一行都认不出）；
-	// 交给 lastb / last 解析成文本才有意义，这两条命令也顺带把记录格式化好了。
+	// btmp / wtmp 是 utmp 定长记录的二进制格式，直接 tail 出来是乱码（一行都认不出）；
+	// 交给 lastb / last 解析成文本才有意义。
+	//
+	// 注意 lastb/last 是从文件尾部往回读的，-n 只取最近这些条，不会把整份读进来，
+	// 所以不需要自己去截断文件（试过 tail -c 配 -f -，这个 util-linux 版本不认）。
 	var cmd, utmpTool string
 	switch filepath.Base(path) {
 	case "btmp":
@@ -107,11 +110,16 @@ func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) 
 	if err != nil {
 		// 读不到文件时退出码非 0，换成能看懂的提示
 		if utmpTool != "" {
-			return logscan.Result{}, fmt.Errorf("读不到这个登录记录（%s 解析失败：文件为空、权限不足或格式不匹配）：%s", utmpTool, path)
+			return logscan.Result{}, fmt.Errorf("没读到登录记录（%s 没有输出）：%s\n"+
+				"常见原因是这个文件是空的（这台机器上还没有失败登录），也可能是权限不足或格式不匹配。",
+				utmpTool, path)
 		}
 		return logscan.Result{}, fmt.Errorf("读不到这个日志（文件不存在或当前账号没有权限）：%s", path)
 	}
 	if strings.TrimSpace(out) == "" {
+		if utmpTool != "" {
+			return logscan.Result{}, fmt.Errorf("%s 里没有记录（这台机器上还没有失败登录）：%s", utmpTool, path)
+		}
 		return logscan.Result{}, fmt.Errorf("这个日志是空的，或最近 %d 行内没有内容：%s", lines, path)
 	}
 	// 日志类型决定用哪套规则：auto 时按路径与内容推断。
@@ -121,9 +129,13 @@ func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) 
 		kind = logscan.GuessLogKind(path, out)
 	}
 	rules := logscan.RulesForKind(logscan.AllRules(), kind)
-	res := logscan.Scan(out, path, rules)
-	res.Kind = kind
-	res.KindAuto = auto
+	// **把已经算好的 kind 传进去**：Scan 内部原来会自己再推断一次
+	//（GuessLogKind），两次推断不一致时就会在 web 行上跑认证关联 ——
+	// 混合日志（前 300 行 syslog 不少于 web 行）正好会撞上。
+	// ScanWithKind 会把实际用的 Kind/KindAuto 回填进 Result。
+	res := logscan.ScanWithKind(out, path, rules, kind)
+	// RuleCount 要保留：RulesForKind 过后 rules 才是本次真正用的规则集，
+	// ScanWithKind 里设的是 AllRules 的长度。
 	res.RuleCount = len(rules)
 
 	// 命中结果落库：态势页要看跨多次扫描、跨目标的累计，
@@ -184,7 +196,12 @@ func (s *LogScanService) run(targetID, script string, timeout time.Duration) (st
 	}
 	out, err := sshx.RunOutput(conn, script, timeout)
 	if err != nil {
-		s.pool.Drop(key)
+		// 只有连接真的不可用才丢弃它。命令自己退出码非 0（比如 lastb 没读到东西）
+		// 也走这里，但绝不能因此 Drop —— 这条连接是终端、文件、监控共用的，
+		// 丢掉就等于把用户正在用的终端一起掐了。
+		if sshx.IsConnError(err) {
+			s.pool.DropIf(key, conn) // 按身份删，别误删别人刚换上的那条
+		}
 		return "", err
 	}
 	return out, nil

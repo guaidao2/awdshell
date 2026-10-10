@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guaidao2/awdshell/internal/domain"
@@ -63,6 +64,46 @@ type SaveTargetInput struct {
 type TargetService struct {
 	store *store.Store
 	vault *secret.Vault
+
+	// onDelete 是"目标被删掉时"要跑的清理钩子（由 main 注入：数据库连接池、
+	// 监控采样基准等），**按注册顺序依次调用**。
+	//
+	// 为什么是列表而不是单个函数：删一个目标要清掉的东西不止一处（dbx 连接与
+	// SSH 隧道、监控的 last/lastAt 基准），而 SetOnDelete 是覆盖语义 ——
+	// 后注册的会把先注册的顶掉，表现成"清了一个、漏了另一个"，
+	// 且两处都不报错（只是什么都不做）。
+	//
+	// 为什么要钩子而不是直接依赖：TargetService 不该反过来依赖 DatabaseService
+	// 或 MonitorService（会形成 target → database → target 的循环）。但"删目标"
+	// 必须能把它们持有的资源一起关掉 —— 否则配置删了、SSH 隧道还开着，
+	// `/api/db/query` 仍能对着已删目标走通。
+	onDelete []func(targetID string)
+
+	// muHooks 保护 onDelete：钩子在启动时注册、在删除目标时读取，
+	// 启动顺序之外基本不会并发，但注册表本身不该是一个裸字段。
+	muHooks sync.Mutex
+}
+
+// AddOnDelete 追加一个"目标删除时"的清理钩子。
+func (s *TargetService) AddOnDelete(fn func(string)) {
+	if fn == nil {
+		return
+	}
+	s.muHooks.Lock()
+	s.onDelete = append(s.onDelete, fn)
+	s.muHooks.Unlock()
+}
+
+// SetOnDelete 注入"目标删除之后"的清理钩子（会**替换**已注册的全部钩子）。
+//
+// 保留它是为了兼容只注册一个钩子的调用点；要追加请用 AddOnDelete。
+func (s *TargetService) SetOnDelete(fn func(string)) {
+	s.muHooks.Lock()
+	s.onDelete = nil
+	if fn != nil {
+		s.onDelete = append(s.onDelete, fn)
+	}
+	s.muHooks.Unlock()
 }
 
 // NewTargetService 构造服务。
@@ -87,6 +128,16 @@ func (s *TargetService) History(limit int) ([]domain.ConnectionRecord, error) {
 		limit = 100
 	}
 	return s.store.ListConnections(limit)
+}
+
+// DeleteHistory 删掉一条连接历史。
+func (s *TargetService) DeleteHistory(id int64) error {
+	return s.store.DeleteConnection(id)
+}
+
+// ClearHistory 清空连接历史；targetID 为空表示全部清掉。
+func (s *TargetService) ClearHistory(targetID string) (int64, error) {
+	return s.store.ClearConnections(targetID)
 }
 
 // Save 新建或更新目标；密码/私钥非空时重新加密落库。
@@ -181,7 +232,24 @@ func (s *TargetService) Save(in SaveTargetInput) (domain.Target, error) {
 }
 
 // Delete 删除目标。
-func (s *TargetService) Delete(id string) error { return s.store.DeleteTarget(id) }
+func (s *TargetService) Delete(id string) error {
+	// **先关连接池，再删配置行**：DropConnsOfTarget 靠 ListDBConns(targetID)
+	// 反查该目标下已建立的连接 id；如果先把 db_conns 删了，它查到 0 条、循环
+	// 一次都不跑 —— 钩子就成了空操作，dbx.Conn 与 SSH 隧道会一直留到进程退出
+	//（审计实测：删完目标后缓存里仍有 1 条、配置 0 条）。
+	if len(s.onDelete) > 0 {
+		s.muHooks.Lock()
+		hooks := append([]func(string){}, s.onDelete...)
+		s.muHooks.Unlock()
+		for _, fn := range hooks {
+			fn(id)
+		}
+	}
+	// 连带清掉它的数据库连接配置与对应密文，
+	// 否则目标删了、配置和密码密文会永久残留
+	_ = s.store.DeleteDBConnsOfTarget(id)
+	return s.store.DeleteTarget(id)
+}
 
 // Auth 取出目标与解密后的认证材料（调用方负责尽快丢弃）。
 func (s *TargetService) Auth(id string) (domain.Target, sshx.Auth, error) {

@@ -40,27 +40,16 @@ func RuleLoadReport() (LoadReport, error) {
 	return allReport, allLoadErr
 }
 
-// LogRuleReport 把规则加载情况写进日志，如实说明哪些规则没生效。
+// LogRuleReport 记录规则库的加载情况。
+//
+// 只在**整个规则库都没加载起来**时报一行：那是会真正影响检测能力的事故。
+//
+// 至于"哪几条规则因为算子没实现被跳过"，**不打日志、也不上界面** ——
+// 那是实现细节，属于开发期信息：运维用户拿到的应当是检测结论，
+// 把"有 7 条规则没生效"摆出来只是自曝其短，对他排查问题没有帮助。
+// 需要时用 RuleLoadReport 在调试或测试里查。
 func LogRuleReport() {
-	report, err := RuleLoadReport()
-	if err != nil {
-		log.Printf("日志检测规则库：加载失败 %v", err)
-		return
-	}
-	log.Printf("日志检测规则库：%d 个文件 / %d 条规则（含内置 %d 条），自带样本 %d 条",
-		report.Files, len(AllRules()), len(DefaultRules), report.TestCases)
-	if len(report.Skipped) > 0 {
-		log.Printf("日志检测规则库：跳过 %d 条（算子或正则不被支持）", len(report.Skipped))
-		for _, s := range report.Skipped {
-			log.Printf("  - %s", s)
-		}
-	}
-	if len(report.UnknownTransforms) > 0 {
-		log.Printf("日志检测规则库：未实现的变换 %v（相关规则会少一层解码）", report.UnknownTransforms)
-	}
-	// 未知算子最容易让人误判：界面上写着"参与规则 N 条"，
-	// 但用户无从知道 RCE、LFI 这些分类里的旗舰规则其实没生效。
-	if len(report.UnknownOperators) > 0 {
-		log.Printf("日志检测规则库：未实现的算子 %v（用这些算子的规则已跳过）", report.UnknownOperators)
+	if _, err := RuleLoadReport(); err != nil {
+		log.Printf("日志检测规则库加载失败，仅使用内置规则: %v", err)
 	}
 }

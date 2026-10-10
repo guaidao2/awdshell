@@ -80,9 +80,14 @@ rules:
           - "$_server["
           - "@eval("
           - "runtime.getruntime().exec"
-          - "processbuilder("
-          - "class.forname("
           - "getruntime().exec"
+          # **日志场景删掉了 `processbuilder(` 与 `class.forname(`**：
+          # 这两个词单独毫无特异性 —— 运维看的 Java 应用日志与异常堆栈里
+          # `java.lang.Class.forName(org.h2.Driver)`、`new ProcessBuilder(...)`
+          # 是常态，而本条是 5 分独立拦的 critical。
+          # 真正的 JVM webshell 一定带 `getRuntime().exec`（上面一行），
+          # 所以去掉它们不丢检出能力。
+          # 注意：这是与 donothack 规则库的有意分叉（那边扫的是 HTTP 参数值）。
           - "file_put_contents($_"
           - "move_uploaded_file($_files"
           - "c99shell"

@@ -40,9 +40,40 @@ type yamlRule struct {
 	Score      int          `yaml:"score"`
 	Message    string       `yaml:"message"`
 	Tags       []string     `yaml:"tags"`
+	Targets    []yamlTarget `yaml:"targets"`
 	Transforms []string     `yaml:"transforms"`
 	Operator   yamlOperator `yaml:"operator"`
 	Test       yamlTest     `yaml:"test"`
+}
+
+// yamlTarget 是规则的适用集合。WAF 的 HTTP 处理链用它决定规则跑在哪个输入上；
+// 日志扫描没有"集合"的概念，但**必须**用它把"只针对上传文件"的规则排除掉 ——
+// 否则像 WS-9004（文件魔数，要 hexEncode 把原始字节转成十六进制）会被套到每一行
+// 日志上，把 `#!/bin/sh`、`cafebabe` 这类纯文本也编码后撞上魔数表。
+type yamlTarget struct {
+	Collection string `yaml:"collection"`
+}
+
+// onlyFileContentTargets 判断规则是否**只**判上传文件的**内容**（FILES_MAGIC）。
+//
+// 为什么只认 FILES_MAGIC、不认 FILES：FILES 里的规则大多看**文件名**
+// （`shell.php.jpg`、`avatar.png.php`），而文件名在访问日志里是逐字出现的
+// （`GET /upload/shell.php.jpg HTTP/1.1`），跳掉它们会丢真检出 ——
+// 上一版就是这么跳过头、被审计抓到的。
+//
+// 反过来 FILES_MAGIC 判的是**文件字节**（靠 hexEncode 把原始字节转成十六进制），
+// 日志行里的文本被编码一遍正好撞上魔数表：`#!/bin/sh` → `23212f…`、
+// `cafebabe` 本身就是纯 hex 会原样返回 —— 于是正常日志被判成 critical webshell。
+func onlyFileContentTargets(ts []yamlTarget) bool {
+	if len(ts) == 0 {
+		return false
+	}
+	for _, t := range ts {
+		if !strings.EqualFold(strings.TrimSpace(t.Collection), "FILES_MAGIC") {
+			return false
+		}
+	}
+	return true
 }
 
 type yamlOperator struct {
@@ -54,6 +85,51 @@ type yamlParams struct {
 	Pattern   string         `yaml:"pattern"`
 	Patterns  []string       `yaml:"patterns"`
 	Operators []yamlOperator `yaml:"operators"`
+	// 语义算子的参数
+	MinFingerprintLen   int      `yaml:"min_fingerprint_len"`
+	MinDepth            int      `yaml:"min_depth"`
+	Fingerprints        []string `yaml:"fingerprints"`
+	ExcludeFingerprints []string `yaml:"exclude_fingerprints"`
+	// Extra 收下未在上面声明的参数，用来拒绝"写了但不生效"的参数
+	Extra map[string]any `yaml:",inline"`
+}
+
+// firstUnknownParam 返回第一个该算子不支持的参数名（没有则空串）。
+//
+// 两处都要查：Extra 里是"结构体没声明的键"，而上面那些**已声明的字段**
+// 只要被规则写了值，同样要按算子的白名单校验 ——
+// 否则 `detectXSS + min_fingerprint_len: 8`、`detectXSS + pattern` 这类
+// 会被静默接受、参数毫无作用，正好是 YAML 注释里说"加载器会拒绝"的那种情况。
+func firstUnknownParam(op string, p yamlParams) string {
+	allow := semanticParamAllow[op]
+	for k := range p.Extra {
+		if !allow[k] {
+			return k
+		}
+	}
+	check := func(name string, written bool) string {
+		if written && !allow[name] {
+			return name
+		}
+		return ""
+	}
+	for _, c := range []struct {
+		name    string
+		written bool
+	}{
+		{"pattern", p.Pattern != ""},
+		{"patterns", len(p.Patterns) > 0},
+		{"operators", len(p.Operators) > 0},
+		{"min_fingerprint_len", p.MinFingerprintLen != 0},
+		{"min_depth", p.MinDepth != 0},
+		{"fingerprints", len(p.Fingerprints) > 0},
+		{"exclude_fingerprints", len(p.ExcludeFingerprints) > 0},
+	} {
+		if bad := check(c.name, c.written); bad != "" {
+			return bad
+		}
+	}
+	return ""
 }
 
 type yamlTest struct {
@@ -69,7 +145,8 @@ type LoadedRule struct {
 	Negative []string
 }
 
-// LoadReport 记录加载时遇到的问题，便于启动日志里如实说明。
+// LoadReport 记录加载时遇到的问题，供内部诊断（测试、调试）使用。
+// 不要拿它去渲染界面或启动日志 —— 见 LogRuleReport 的说明。
 type LoadReport struct {
 	Files             int
 	Rules             int
@@ -124,18 +201,37 @@ func LoadEmbedded() ([]LoadedRule, LoadReport, error) {
 	for i := range all {
 		report.TestCases += len(all[i].Positive) + len(all[i].Negative)
 	}
-	for name := range UnknownTransforms {
-		report.UnknownTransforms = append(report.UnknownTransforms, name)
-	}
-	sort.Strings(report.UnknownTransforms)
-	for name := range unknownOperators {
-		report.UnknownOperators = append(report.UnknownOperators, name)
-	}
-	sort.Strings(report.UnknownOperators)
+	// 两个"未实现名字"注册表都走带锁快照：LoadRules 可能被并发调用，
+	// 直接 range 一个会被并发写的 map 同样是运行时崩溃。
+	report.UnknownTransforms = unknownTransformNames()
+	report.UnknownOperators = unknownOperatorNames()
 	return all, report, nil
 }
 
+// unknownOperators 记录规则里读到但本版本不支持的算子名。
+//
+// 与 UnknownTransforms 一样由 unknownMu 保护：LoadRules 是导出函数，可以被
+// 并发调用，而**并发写 map 是运行时崩溃**（不是数据错乱）。
 var unknownOperators = map[string]bool{}
+
+// recordUnknownOperator 记下一个不支持的算子名（带锁）。
+func recordUnknownOperator(name string) {
+	unknownMu.Lock()
+	unknownOperators[name] = true
+	unknownMu.Unlock()
+}
+
+// unknownOperatorNames 取出不支持的算子名快照（带锁，已排序）。
+func unknownOperatorNames() []string {
+	unknownMu.Lock()
+	out := make([]string, 0, len(unknownOperators))
+	for name := range unknownOperators {
+		out = append(out, name)
+	}
+	unknownMu.Unlock()
+	sort.Strings(out)
+	return out
+}
 
 // LoadRules 解析一份规则文件；返回加载成功的规则与被跳过的条目说明。
 func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
@@ -167,8 +263,34 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 			rule.Category = doc.Meta.Category
 		}
 
+		// 只判上传文件**内容**的规则（FILES_MAGIC）在日志行扫描里没有意义：
+		// 它们判的是文件字节，而这里把每条规则套在每一行文本上。
+		// 典型是 WS-9004（文件魔数，靠 hexEncode 把原始字节转成十六进制）——
+		// 套到日志行上会把 `#!/bin/sh`、`cafebabe` 这类**纯文本**也编码一遍，
+		// 正好撞上魔数表，于是正常的日志行被判成 critical 的 webshell。
+		//
+		// **注意只看 FILES_MAGIC，不看 FILES**：FILES 类规则大多判文件名，
+		// 而文件名在访问日志里逐字出现，跳掉会丢真检出。
+		if onlyFileContentTargets(yr.Targets) {
+			skipped = append(skipped,
+				fmt.Sprintf("%s(%s): 只判上传文件内容（FILES_MAGIC），不适用于日志行扫描，整体跳过", id, source))
+			continue
+		}
+
+		// 参数白名单：**所有**算子都过一遍，不只是语义算子 ——
+		// 否则 `regex + min_depth: 2`、`pm + min_fingerprint_len: 8` 这类
+		// "写了但不生效"的参数会被静默接受。
+		opName := strings.ToLower(strings.TrimSpace(yr.Operator.Name))
+		if _, known := operatorParamAllow[opName]; known {
+			if bad := firstUnknownParam(opName, yr.Operator.Params); bad != "" {
+				skipped = append(skipped,
+					fmt.Sprintf("%s(%s): %s 不支持参数 %q", id, source, opName, bad))
+				continue
+			}
+		}
+
 		// 算子：regex 用正则，pm 用关键词表
-		switch strings.ToLower(strings.TrimSpace(yr.Operator.Name)) {
+		switch opName {
 		case "regex":
 			expr := strings.TrimSpace(yr.Operator.Params.Pattern)
 			if expr == "" {
@@ -213,7 +335,7 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 					}
 				default:
 					if n := strings.TrimSpace(sub.Name); n != "" {
-						unknownOperators[n] = true
+						recordUnknownOperator(n)
 					}
 				}
 			}
@@ -230,16 +352,33 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 
 		default:
 			name := strings.TrimSpace(yr.Operator.Name)
-			if name != "" {
-				unknownOperators[name] = true
-				skipped = append(skipped, fmt.Sprintf("%s(%s): 暂不支持的算子 %q", id, source, name))
-			} else {
-				skipped = append(skipped, fmt.Sprintf("%s(%s): 缺少 operator", id, source))
+			lower := strings.ToLower(name)
+			if !semanticOperatorNames[lower] {
+				if name != "" {
+					recordUnknownOperator(name)
+					skipped = append(skipped, fmt.Sprintf("%s(%s): 暂不支持的算子 %q", id, source, name))
+				} else {
+					skipped = append(skipped, fmt.Sprintf("%s(%s): 缺少 operator", id, source))
+				}
+				continue
 			}
-			continue
+			// 语义算子（参数已在上面的统一白名单里校验过）
+			fn, err := buildSemantic(lower, yr.Operator.Params)
+			if err != nil {
+				skipped = append(skipped, fmt.Sprintf("%s(%s): %v", id, source, err))
+				continue
+			}
+			rule.Semantic = fn
 		}
 
 		chain, chainNames := ChainFromNames(yr.Transforms)
+		// 没写 transforms 的规则套默认链。CompileRules 的注释一直这么承诺，
+		// 但 ChainFromNames(nil) 返回的是**非 nil 空切片**，`len(chain) == 0`
+		// 这个条件从来没被满足过 —— 这类规则会拿到空链、在原始文本上匹配。
+		// （规则库当前全都写了 transforms，所以是潜伏项。）
+		if len(chain) == 0 {
+			chain, chainNames = DefaultChain, DefaultTransformNames
+		}
 		rule.Chain = chain
 		rule.TransformNames = chainNames
 		rule.compile()

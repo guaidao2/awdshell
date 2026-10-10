@@ -147,7 +147,7 @@
 
   // 把态势数据导成 CSV：来源排行、类型分布、目标分布、时间线各一段。
   // 一段一个表头，方便直接贴进报告或表格工具。
-  function exportStats() {
+  async function exportStats() {
     var st = state.stats;
     if (!st || !st.total) { hint('还没有数据可以导出', true); return; }
 
@@ -185,16 +185,14 @@
       })));
 
     // BOM：不加的话 Excel 打开中文会乱码
-    var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = '威胁态势-' + new Date().toISOString().slice(0, 10) + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
-    hint('已导出态势数据');
+    var fname = '威胁态势-' + new Date().toISOString().slice(0, 10) + '.csv';
+    try {
+      if (!window.AwdSaveFile) throw new Error('保存入口没加载，刷新一下页面');
+      var saved = await window.AwdSaveFile(fname, '\ufeff' + lines.join('\r\n'), 'text/csv;charset=utf-8');
+      hint(saved ? ('已保存到 ' + saved) : '已导出态势数据');
+    } catch (e) {
+      hint('保存失败：' + e.message, true);
+    }
   }
 
   // ---------- 渲染 ----------
@@ -202,22 +200,25 @@
   function timelineChart(tl) {
     if (!tl || !tl.length) return '';
     var W = 640, H = 90, pad = 4;
+    // bucket / count 落空时不能直接算：undefined 参与运算会得到 NaN，
+    // 整张图的柱子高度全变成 "NaN"，比不显示还难判断
     var max = 1;
-    tl.forEach(function (b) { max = Math.max(max, b.count); });
+    tl.forEach(function (b) { max = Math.max(max, Number(b && b.count) || 0); });
     var bw = Math.min(38, Math.max(4, (W - pad * 2) / tl.length - 3));
 
     var bars = tl.map(function (b, i) {
-      var h = (b.count / max) * (H - 22);
+      var h = ((Number(b && b.count) || 0) / max) * (H - 22);
       var x = pad + i * ((W - pad * 2) / tl.length);
       var y = H - 16 - h;
       return '<rect class="th-bar" x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" ' +
         'width="' + bw.toFixed(1) + '" height="' + Math.max(1, h).toFixed(1) + '" rx="2">' +
-        '<title>' + esc(b.bucket) + '：' + b.count + ' 条</title></rect>';
+        '<title>' + esc(b && b.bucket) + '：' + (Number(b && b.count) || 0) + ' 条</title></rect>';
     }).join('');
 
-    // 只标首个与末个日期，中间交给柱子本身表达
-    var first = tl[0].bucket.slice(5);
-    var last = tl[tl.length - 1].bucket.slice(5);
+    // 只标首个与末个日期，中间交给柱子本身表达。
+    // bucket 落空时 slice 会抛，先转成字符串再截。
+    var first = String((tl[0] && tl[0].bucket) == null ? '' : tl[0].bucket).slice(5);
+    var last = String((tl[tl.length - 1] && tl[tl.length - 1].bucket) == null ? '' : tl[tl.length - 1].bucket).slice(5);
     return '<div class="th-chart">' +
       '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + bars + '</svg>' +
       '<div class="th-chart-axis"><span>' + esc(first) + '</span><span>' + esc(last) + '</span></div>' +
@@ -271,6 +272,12 @@
   }
 
   function render(st) {
+    // 后端返回非对象（代理错误页、接口不匹配）时不要冒成
+    // "Cannot read properties of null (reading 'total')"
+    if (!st || typeof st !== 'object') {
+      $('th-body').innerHTML = '<div class="th-empty error-text">数据格式不符合预期，请稍后重试</div>';
+      return;
+    }
     state.stats = st;
 
     if (!st.total) {
@@ -281,7 +288,7 @@
     }
 
     var critical = 0;
-    (st.by_severity || []).forEach(function (s) { if (s.name === 'critical') critical = s.count; });
+    (st.by_severity || []).forEach(function (s) { if (s.name === 'critical') critical = Number(s.count) || 0; });
 
     var card = function (cls, n, label, sub) {
       return '<div class="th-stat ' + cls + '"><span class="n">' + n + '</span>' +
@@ -295,7 +302,7 @@
       card('crit', critical, '严重级别', 'critical') +
       card('', (st.by_source_ip || []).length, '来源地址', '独立 IP 数') +
       card('', (st.by_target || []).length, '涉及主机', '被检测出问题的主机') +
-      card('dec', st.decoded_total, '解码后命中', '原文看不出、解码才发现') +
+      card('dec', (Number(st.decoded_total) || 0), '解码后命中', '原文看不出、解码才发现') +
       '</div>' +
 
       '<div class="th-grid">' +

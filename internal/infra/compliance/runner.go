@@ -1,6 +1,7 @@
 package compliance
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -50,6 +51,16 @@ func LoadSets() ([]Set, []string, error) {
 			if c.Expect.Type == "" {
 				c.Expect.Type = ExpectManual
 			}
+			// 正则类检查项在**加载时**就编译一次：写错了要当场记进 problems 并跳过。
+			// 否则要到运行期才发现，而 regex_not_match 的失败方向是"判成合规"
+			//（fail-open）—— 该报不合规的报成合规，比直接报错危险得多。
+			if c.Expect.Type == ExpectRegexMatch || c.Expect.Type == ExpectRegexNotMatch {
+				if _, err := compiled(strings.TrimSpace(c.Expect.Pattern)); err != nil {
+					problems = append(problems,
+						fmt.Sprintf("%s: 检查项 %s 的正则无法编译（%v），已跳过", name, c.ID, err))
+					continue
+				}
+			}
 			if c.Timeout <= 0 {
 				c.Timeout = 10
 			}
@@ -75,9 +86,33 @@ func AllChecks(sets []Set) []Check {
 // ExecFunc 是执行一条远程命令的函数（由上层用 SSH 实现）。
 type ExecFunc func(command string, timeoutSec int) (string, error)
 
-// Run 依次执行检查项并判定。
+// Run 依次执行检查项并判定（无取消）。
 // onlyIDs 非空时只跑指定的项；progress 用于汇报进度（可为 nil）。
+//
+// 保留这个签名是为了兼容已有调用方；需要取消/需要知道"指定的 ID 没匹配上"时
+// 用 RunWithContext。
 func Run(checks []Check, exec ExecFunc, onlyIDs []string, progress func(done, total int)) []Result {
+	results, _ := RunWithContext(context.Background(), checks, exec, onlyIDs, progress)
+	return results
+}
+
+// RunWithContext 与 Run 相同，但支持中途取消，并把筛选时的问题回传。
+//
+// ctx 会在每项开始前检查一次：一轮 60+ 项在慢机器上要跑几分钟，用户点了取消
+// 或退出目标时必须能停下来，而不是把整轮跑完。
+//
+// 返回的第二个值是 problems：目前包括"指定了但根本不存在的检查项 ID"。
+// 以前这类 ID 被静默忽略（实测指定 `[A TYPO-ID]` 只跑了 1 项、界面上毫无提示，
+// 用户会以为那一项已经查过且通过）。
+//
+// 取消时返回的是**已经跑完的那些**结果，不让前面白跑 —— 调用方应当把
+// 不完整当成"部分结果"展示，而不是当成整轮通过。
+func RunWithContext(ctx context.Context, checks []Check, exec ExecFunc, onlyIDs []string, progress func(done, total int)) ([]Result, []string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var problems []string
 	filter := map[string]bool{}
 	for _, id := range onlyIDs {
 		if id = strings.TrimSpace(id); id != "" {
@@ -86,22 +121,41 @@ func Run(checks []Check, exec ExecFunc, onlyIDs []string, progress func(done, to
 	}
 
 	selected := make([]Check, 0, len(checks))
+	known := map[string]bool{}
 	for _, c := range checks {
+		known[c.ID] = true
 		if len(filter) > 0 && !filter[c.ID] {
 			continue
 		}
 		selected = append(selected, c)
 	}
 
+	// 未知 ID 必须报出来：否则"我指定了 3 项"和"实际只跑了 1 项"在界面上
+	// 长得一模一样，用户会把没跑的项当成通过。
+	for _, id := range onlyIDs {
+		if id = strings.TrimSpace(id); id == "" {
+			continue
+		}
+		if !known[id] {
+			problems = append(problems, fmt.Sprintf("检查项 ID %q 不存在，已忽略", id))
+		}
+	}
+
 	results := make([]Result, 0, len(selected))
 	for i, c := range selected {
+		// 每项开始前看一眼取消：正在跑的那一项由 exec 自己的 timeout 收尾
+		if err := ctx.Err(); err != nil {
+			problems = append(problems,
+				fmt.Sprintf("核查已取消，还有 %d 项未执行", len(selected)-i))
+			break
+		}
 		out, err := exec(c.Command, c.Timeout)
 		results = append(results, Evaluate(c, out, err))
 		if progress != nil {
 			progress(i+1, len(selected))
 		}
 	}
-	return results
+	return results, problems
 }
 
 // CategoryStat 是按类别统计的结果。

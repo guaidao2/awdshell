@@ -1,7 +1,6 @@
 package store
 
 import (
-	"sync"
 	"time"
 )
 
@@ -64,42 +63,12 @@ type ThreatStats struct {
 	Recent       []ScanEvent  `json:"recent"`
 }
 
-var scanEventOnce sync.Once
-var scanEventErr error
-
-// ensureScanEvents 建表（只做一次）。索引按查询方式建：按时间过滤、按来源 IP 聚合。
-func (s *Store) ensureScanEvents() error {
-	scanEventOnce.Do(func() {
-		stmts := []string{
-			`CREATE TABLE IF NOT EXISTS scan_events (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				ts INTEGER NOT NULL,
-				target_id TEXT NOT NULL DEFAULT '',
-				target_name TEXT NOT NULL DEFAULT '',
-				path TEXT NOT NULL DEFAULT '',
-				kind TEXT NOT NULL DEFAULT '',
-				rule_id TEXT NOT NULL DEFAULT '',
-				rule_name TEXT NOT NULL DEFAULT '',
-				severity TEXT NOT NULL DEFAULT '',
-				category TEXT NOT NULL DEFAULT '',
-				source_ip TEXT NOT NULL DEFAULT '',
-				line_no INTEGER NOT NULL DEFAULT 0,
-				decoded INTEGER NOT NULL DEFAULT 0,
-				sample TEXT NOT NULL DEFAULT ''
-			)`,
-			`CREATE INDEX IF NOT EXISTS idx_scan_events_ts ON scan_events(ts)`,
-			`CREATE INDEX IF NOT EXISTS idx_scan_events_ip ON scan_events(source_ip)`,
-			`CREATE INDEX IF NOT EXISTS idx_scan_events_target ON scan_events(target_id)`,
-		}
-		for _, q := range stmts {
-			if _, err := s.db.Exec(q); err != nil {
-				scanEventErr = err
-				return
-			}
-		}
-	})
-	return scanEventErr
-}
+// ensureScanEvents 是历史遗留的空实现 —— scan_events 与它的三个索引已并入
+// store.go 的 schema，每次 Open 都会建。保留函数只为不惊动调用方。
+//
+// 原来挂在包级 sync.Once 上：sync.Once 是**进程级**而不是"每个库一次"，
+// 同进程第二个 *Store 上这张表就是没有，且包级错误只试一次、失败后永不再建。
+func (s *Store) ensureScanEvents() error { return nil }
 
 // InsertScanEvents 批量写入攻击事件。
 func (s *Store) InsertScanEvents(events []ScanEvent) error {

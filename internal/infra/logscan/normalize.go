@@ -2,10 +2,13 @@ package logscan
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Transform 是单个变换函数：输入输出都是字符串，不得修改入参语义（Go 字符串本就不可变）。
@@ -35,14 +38,46 @@ var TransformRegistry = map[string]Transform{
 	"normalizePath":      normalizePath,
 	"base64Decode":       base64Decode,
 	"hexDecode":          hexDecode,
+	"hexEncode":          hexEncode,
 }
 
-// UnknownTransforms 记录从规则里读到但本版本没实现的变换名（供启动时提示）。
+// UnknownTransforms 记录从规则里读到但本版本没实现的变换名，供内部诊断用。
+// 不要渲染到界面或启动日志 —— 见 LogRuleReport 的说明。
+//
+// **不要直接读写这个 map**：它由下面的 unknownMu 保护。ChainFromNames 与
+// LoadRules 都是导出函数、可能被并发调用（比如两个 -web 请求同时加载规则集），
+// 而 map 并发写是**运行时直接崩**（fatal error: concurrent map writes），
+// 不是数据错乱那么轻。读也要走 recordUnknown / unknownTransformNames 这两个
+// 带锁的口子。原来唯一调用方在 sync.Once 里，属于侥幸没炸。
 var UnknownTransforms = map[string]bool{}
+
+// unknownMu 保护 UnknownTransforms 与 loader.go 里的 unknownOperators
+// ——两个注册表用同一把锁，简化推理（它们只在加载规则时写，竞争极低）。
+var unknownMu sync.Mutex
+
+// recordUnknown 记下一个未实现的变换名（带锁）。
+func recordUnknown(name string) {
+	unknownMu.Lock()
+	UnknownTransforms[name] = true
+	unknownMu.Unlock()
+}
+
+// unknownTransformNames 取出未实现的变换名快照（带锁，已排序）。
+func unknownTransformNames() []string {
+	unknownMu.Lock()
+	out := make([]string, 0, len(UnknownTransforms))
+	for name := range UnknownTransforms {
+		out = append(out, name)
+	}
+	unknownMu.Unlock()
+	sort.Strings(out)
+	return out
+}
 
 // ChainFromNames 把变换名列表解析成函数链，同时返回实际生效的变换名
 // （与返回的链一一对应）。未实现的变换会被跳过并记进 UnknownTransforms ——
-// 跳过会导致漏检，所以调用方应当把这份清单暴露出来，让人知道哪些规则打了折扣。
+// 跳过会导致漏检，所以要记下来供**内部诊断**（测试与调试）用；
+// 但不要外显给用户：那是实现细节，他要的是检测结论。
 func ChainFromNames(names []string) ([]Transform, []string) {
 	chain := make([]Transform, 0, len(names))
 	used := make([]string, 0, len(names))
@@ -56,7 +91,7 @@ func ChainFromNames(names []string) ([]Transform, []string) {
 			used = append(used, name)
 			continue
 		}
-		UnknownTransforms[name] = true
+		recordUnknown(name)
 	}
 	return chain, used
 }
@@ -273,6 +308,32 @@ func sqlHexDecode(s string) string {
 		return m
 	})
 	return s
+}
+
+// hexEncode 把内容转成十六进制文本。
+//
+// 用在"匹配原始字节"的规则上：规则里的 pm 模式写成十六进制，而输入是原始字节，
+// 先编码再比对（见 60-webshell.yaml 里 FILES_MAGIC 那条）。
+//
+// 已经是**纯十六进制文本**的输入原样返回，不再编码一次 ——
+// 这类规则的输入有两种形态：真实的原始字节（要编码），以及本身就是十六进制
+// 文本的内容（例如日志里直接出现的一串 hex）。二次编码会把后一种彻底错开，
+// 反而是这个算子最容易踩的坑。
+func hexEncode(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) >= 4 && len(trimmed)%2 == 0 && len(trimmed) <= 4096 {
+		allHex := true
+		for i := 0; i < len(trimmed); i++ {
+			if _, ok := unhexByte(trimmed[i]); !ok {
+				allHex = false
+				break
+			}
+		}
+		if allHex {
+			return s
+		}
+	}
+	return hex.EncodeToString([]byte(s))
 }
 
 // hexDecode 处理纯十六进制串（尽量保守：长度偶数且全部是十六进制字符）。

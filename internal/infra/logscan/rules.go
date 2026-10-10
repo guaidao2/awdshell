@@ -26,6 +26,13 @@ func init() {
 }
 
 // DefaultRules 内置规则集（Web 攻击、认证异常、后门痕迹）。
+//
+// **这里的正则用 regexp.MustCompile 在包初始化时编译，是有意的**：
+// 内置规则是编译期常量，写错了就该在启动那一刻炸出来（panic + 明确的
+// "error parsing regexp" 信息），而不是像 YAML 规则那样被静默跳过 ——
+// 静默跳过的后果是"这条规则永远不告警"，而没有任何人会注意到。
+// YAML 规则不同：那是外部内容，一条坏规则不该让整个扫描内核起不来，
+// 所以 loader 里对它是 Compile + 记 skipped。
 var DefaultRules = []Rule{
 	{
 		ID: "WEB-SQLI", Name: "SQL 注入载荷", Severity: SevHigh, Category: "sqli",

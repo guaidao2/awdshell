@@ -53,6 +53,14 @@
       '  <section>' +
       '    <h3>文件</h3>' +
       '    <label class="st-check"><input type="checkbox" id="st-trash" /> 删除时移入远程回收站（更安全）</label>' +
+      '    <label class="st-dir-label">默认下载目录' +
+      '      <span class="st-dir-row">' +
+      '        <input type="text" id="st-download-dir" spellcheck="false" placeholder="留空则交给浏览器下载（只能落到系统默认下载目录）" />' +
+      '        <button id="st-pick-dir" type="button">浏览…</button>' +
+      '      </span>' +
+      '    </label>' +
+      '    <p class="hint">填了之后，文件下载与所有导出（核查报告、日志检测结果、威胁态势、数据表 CSV）都直接写到这个目录，不再经过浏览器。同名文件会自动加序号，不覆盖已有的。' +
+      '      浏览器模式没有原生目录对话框，「浏览」会提示不支持，手动填路径即可。</p>' +
       '  </section>' +
       '  <section>' +
       '    <h3>检测结果数据</h3>' +
@@ -78,6 +86,25 @@
     $('st-prune').addEventListener('click', pruneNow);
     $('st-event-prune').addEventListener('click', pruneEvents);
     $('st-event-clear').addEventListener('click', clearEvents);
+    $('st-pick-dir').addEventListener('click', pickDir);
+  }
+
+  // 选默认下载目录。桌面形态走 Wails 的原生目录对话框；
+  // 浏览器模式后端会如实报"不支持"，让用户手填。
+  async function pickDir() {
+    var btn = $('st-pick-dir');
+    btn.disabled = true;
+    try {
+      var r = await req('/api/system/pick-dir', { method: 'POST', body: '{}' });
+      if (r.dir) {
+        $('st-download-dir').value = r.dir;
+        msg('已选目录，点「保存设置」生效');
+      }
+    } catch (e) {
+      msg(e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   async function load() {
@@ -90,6 +117,7 @@
       $('st-trash').checked = !!s.trash_on_delete;
       $('st-cwd').checked = s.term_track_cwd !== false;
       $('st-event-days').value = s.event_keep_days;
+      $('st-download-dir').value = s.download_dir || '';
       loadEventCount();
       msg('已加载当前设置');
     } catch (e) {
@@ -116,7 +144,8 @@
           term_scrollback: num('st-scroll', 10000),
           trash_on_delete: $('st-trash').checked,
           term_track_cwd: $('st-cwd').checked,
-          event_keep_days: num('st-event-days', 30)
+          event_keep_days: num('st-event-days', 30),
+          download_dir: $('st-download-dir').value.trim()
         })
       });
       // 回写运行时设置：删除是否走回收站、终端目录是否跟随，读的都是

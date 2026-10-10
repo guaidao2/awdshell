@@ -13,6 +13,21 @@ import (
 func (s *Server) handleThreat(w http.ResponseWriter, r *http.Request) {
 	action := strings.TrimPrefix(r.URL.Path, "/api/threat/")
 
+	// 只读 action 明确只允许 GET，写 action 明确只允许 POST：
+	// Go 的 GET 也能带 body，prune 之前没有方法校验，裸 GET 就能删事件表。
+	switch action {
+	case "stats", "count":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+	default:
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+	}
+
 	switch action {
 	case "stats":
 		days := 7
