@@ -117,7 +117,7 @@
     sel.innerHTML = html;
 
     if (window.AwdViews) {
-      window.AwdViews.followButton('th-follow-state', state.followActive && !state.targetId, '态势范围', function () {
+      window.AwdViews.followButton('th-follow-state', state.followActive, '态势范围', function () {
         state.followActive = true;
         syncToActiveSession();
         renderTargets();

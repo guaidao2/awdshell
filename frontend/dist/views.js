@@ -17,6 +17,14 @@
 
   function $(id) { return document.getElementById(id); }
 
+    // 打开整页视图会把 work-body 整个 display:none —— 但**焦点还留在终端的
+    // 输入框上**：之后敲的每一个字符都会被 term.onData 静默发到远端 shell，
+    // 而用户以为自己只是在看设置页。切视图前必须先把焦点移走。
+    function blurActive() {
+      var a = document.activeElement;
+      if (a && a !== document.body && typeof a.blur === "function") a.blur();
+    }
+
   function isOpen(area) {
     var el = $(area);
     return !!el && !el.hidden;
@@ -35,7 +43,7 @@
     if (!el) return false;
     var willOpen = el.hidden;
 
-    if (willOpen) closeAll();
+    if (willOpen) { closeAll(); blurActive(); }
     el.hidden = !willOpen;
 
     var wb = $('work-body');

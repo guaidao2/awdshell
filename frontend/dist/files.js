@@ -871,7 +871,9 @@
     window.addEventListener('keydown', function (e) {
       // Ctrl/Cmd+S 保存正在编辑的文件（之前只能点按钮，习惯上会按快捷键）
       if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
-        if (!$('file-modal').hidden) { e.preventDefault(); saveFile(); }
+        // 一律 preventDefault：编辑器没开时不拦的话，浏览器会弹出「保存网页」
+        e.preventDefault();
+        if (!$('file-modal').hidden) saveFile();
         return;
       }
       if (e.key !== 'Escape') return;

@@ -585,8 +585,7 @@
       if (window.AwdViews) window.AwdViews.closeAll();
       if ($('files-area')) {
         $('files-area').hidden = true;
-        window.dispatchEvent(new Event('awdshell:files-hide'));
-      }
+        }
     }
     area.hidden = !show;
     if (window.AwdSidePanel) window.AwdSidePanel.sync('monitor');

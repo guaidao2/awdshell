@@ -219,10 +219,11 @@ func (s *SessionService) Open(targetID string, cols, rows int) (*domain.SessionH
 		Title:     target.Name,
 		State:     domain.StateReady,
 		WSURL:     fmt.Sprintf("%s/ws/term/%s", s.WSBase, sess.ID),
-		WSToken:   sess.Token,
-		Cols:      cols,
-		Rows:      rows,
-		RecordID:  sess.RecordID,
+		// 读 Token 要走会话自己的锁（写方 Attach 与 ConsumeToken 都持它）
+		WSToken:  sess.snapshotToken(),
+		Cols:     cols,
+		Rows:     rows,
+		RecordID: sess.RecordID,
 	}, nil
 }
 
@@ -313,7 +314,7 @@ func (s *SessionService) Attach(id string) (*domain.SessionHandle, error) {
 		SessionID: sess.ID,
 		TargetID:  sess.Target.ID,
 		Title:     sess.Target.Name,
-		State:     sess.State,
+		State:     sess.snapshotState(),
 		WSURL:     fmt.Sprintf("%s/ws/term/%s", s.WSBase, sess.ID),
 		WSToken:   token,
 		RecordID:  sess.RecordID,
@@ -339,6 +340,22 @@ func (s *SessionService) Get(id string) (*Session, bool) {
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[id]
 	return sess, ok
+}
+
+// snapshotToken / snapshotState 用会话自己的锁读字段。
+//
+// Token 的写在 Attach 里持 sess.mu、ConsumeToken 也持它；State 会被 finish/close
+// 路径改写。之前 Open/Attach/List 直接读裸字段，属纸面竞态（go build/vet 看不出）。
+func (s *Session) snapshotToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Token
+}
+
+func (s *Session) snapshotState() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.State
 }
 
 // ConsumeToken 校验并消费一次性令牌（防重放）。
@@ -382,7 +399,7 @@ func (s *SessionService) List() []domain.SessionInfo {
 			SessionID: sess.ID,
 			TargetID:  sess.Target.ID,
 			Title:     sess.Target.Name,
-			State:     sess.State,
+			State:     sess.snapshotState(),
 			StartedAt: sess.StartedAt,
 		})
 	}

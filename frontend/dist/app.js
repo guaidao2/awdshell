@@ -62,7 +62,15 @@
     var res = await fetch(API + path, opt);
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
-      try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 非 JSON */ }
+      try {
+        var j = await res.json();
+        if (j && j.error) msg = j.error;
+        // 部分失败（批量删除）回的是 { deleted, failed:[{path,error}] }，没有 error 字段 ——
+        // 不认它就只能给用户一句 "409 Conflict"，逐条失败原因全丢。
+        else if (j && j.failed && j.failed.length) {
+          msg = j.failed.map(function (f) { return f.path + "：" + f.error; }).join("\n");
+        }
+      } catch (e) { /* 非 JSON */ }
       throw new Error(msg);
     }
     return res.json();
@@ -121,7 +129,7 @@ async function renderHostKeyInfo(targetID) {
         await req('/api/hostkeys/forget', { method: 'POST', body: JSON.stringify({ target_id: targetID }) });
         window.AwdToast.ok('已清除，下次连接会重新记录');
         renderHostKeyInfo(targetID);
-      } catch (e) { window.AwdToast.error('清除失败：' + e.message); }
+      } catch (e) { if (window.AwdToast) window.AwdToast.error('清除失败：' + e.message); }
     });
   } catch (e) {
     box.innerHTML = '<span class="hint error-text">读取主机密钥失败：' + esc(e.message) + '</span>';
@@ -631,7 +639,7 @@ async function renderHostKeyInfo(targetID) {
       // 防御：toast.js 万一没加载，不能把真实错误再吞一次（原来这里会抛
       // "Cannot read properties of undefined"，把"连接为什么失败"彻底盖住）
       if (window.AwdToast && window.AwdToast.error) {
-        window.AwdToast.error('连接失败\n\n' + e.message);
+        if (window.AwdToast) window.AwdToast.error('连接失败\n\n' + e.message);
       } else {
         console.error('连接失败：' + e.message);
       }
@@ -705,10 +713,14 @@ async function renderHostKeyInfo(targetID) {
     //   全选、复制、粘贴也在终端右键菜单里
     function copySelection(text) {
       if (!text) return false;
+      // 复制后清掉选区：留着高亮的话，再右键「复制」拿到的还是同一个旧值，
+      // 用户也分不清这次到底复制成功没有（终端惯例就是复制即取消选中）。
+      var done = function () { if (term.clearSelection) term.clearSelection(); };
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).catch(function () { legacyCopy(text); });
+        navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text); done(); });
       } else {
         legacyCopy(text);
+        done();
       }
       return true;
     }
@@ -726,11 +738,16 @@ async function renderHostKeyInfo(targetID) {
       document.body.removeChild(ta);
     }
     function pasteFromClipboard() {
-      if (navigator.clipboard && navigator.clipboard.readText) {
+      // 读不到剪贴板时必须**出声**：右键菜单点「粘贴」没反应，用户只会以为坏掉了
+      if (!(navigator.clipboard && navigator.clipboard.readText)) {
+        if (window.AwdToast && window.AwdToast.warn) window.AwdToast.warn("读不到剪贴板，请用 Ctrl+Shift+V");
+        return;
+      }
       navigator.clipboard.readText().then(function (txt) {
         if (txt) term.paste(txt);
-      }).catch(function () { /* 读不到就让用户用 Ctrl+Shift+V 或鼠标中键 */ });
-      }
+      }).catch(function () {
+        if (window.AwdToast && window.AwdToast.warn) window.AwdToast.warn("读不到剪贴板，请用 Ctrl+Shift+V");
+      });
     }
 
     var termKeyHandler = function (e) {
@@ -1022,7 +1039,7 @@ async function renderHostKeyInfo(targetID) {
       setStatus(name + '：' + r.message);
     }).catch(function (e) {
       setStatus(name + ' 测试失败：' + e.message);
-      window.AwdToast.error('测试连接失败\n\n' + e.message);
+      if (window.AwdToast) window.AwdToast.error('测试连接失败\n\n' + e.message);
     });
   }
 
@@ -1087,10 +1104,15 @@ async function renderHostKeyInfo(targetID) {
 
     el.modal.addEventListener('click', function (e) { if (e.target === el.modal) closeForm(); });
     document.addEventListener('keydown', function (e) {
+      // 终端有焦点时，按键**全归终端**：Ctrl+W 在 shell/vim 里是「删掉光标前一个词」，
+      // Ctrl+Tab 在 zsh/bash 里是补全/切词 —— 全局绝不能在这里抢。
+      // （用户报过：按一下删词，结果当前标签被关掉，正在跑的任务一起没了。）
+      var et = e.target;
+      if (et && et.closest && et.closest(".xterm")) return;
       if (e.key === 'Escape' && !el.modal.hidden) closeForm();
       if (e.key === 'Enter' && !el.modal.hidden && e.target && e.target.tagName === 'INPUT') saveForm();
 
-      // 终端里用不到这两个组合，留给界面：Ctrl+W 关标签、Ctrl+Tab 切换标签
+      // 焦点不在终端时，Ctrl+W 关标签、Ctrl+Tab 切换标签（终端有焦点时上面已经 return）
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'w' || e.key === 'W')) {
         if (state.active && el.modal.hidden) {
           e.preventDefault();

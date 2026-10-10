@@ -22,7 +22,6 @@
     // 每次切目标/切连接自增，用来丢弃过期响应：
     // 否则旧连接的在途响应会把新状态写满，左侧树显示 A 的库表、
     // 点一下表名生成的 SQL 却发给 B（同名表时就是改错库）
-    loadSeq: 0
   };
 
   // ---------- 工具 ----------
@@ -124,20 +123,20 @@
       state.targetId = this.value;
       state.followActive = false;
       state.connId = '';
-      state.loadSeq++; // 作废在途请求
+      state.connSeq++; state.treeSeq++; // 切连接：列表与树都要作废
       renderFollow();
       loadConns();
     });
     $('db-follow-state').addEventListener('click', function () {
       state.followActive = true;
-      state.loadSeq++;
+      state.connSeq++;
       syncToActiveSession();
       renderTargets();  // 显式刷一次按钮状态，否则文案会停在"已锁定"
       loadConns();
     });
     $('db-conn').addEventListener('change', function () {
       state.connId = this.value;
-      state.loadSeq++; // 作废在途请求
+      state.connSeq++; state.treeSeq++; // 切连接：列表与树都要作废
       state.databases = [];
       state.expanded = {};
       state.tables = {};
@@ -296,17 +295,17 @@
     state.expanded = {};
     state.tables = {};
       // 记下这一轮属于哪次请求：切目标时旧响应回来不能往界面上贴。
-      var seq = ++state.loadSeq;
+      var seq = ++state.connSeq;
     try {
       var r = await req('/api/db/conns?target_id=' + encodeURIComponent(state.targetId));
-        if (seq !== state.loadSeq) return;
+        if (seq !== state.connSeq) return;
       state.conns = r.conns || [];
     } catch (e) {
-        if (seq !== state.loadSeq) return;
+        if (seq !== state.connSeq) return;
       state.conns = [];
       hint('读取连接列表失败：' + e.message, true);
     }
-      if (seq !== state.loadSeq) return;
+      if (seq !== state.connSeq) return;
     if (state.connId && !state.conns.some(function (c) { return c.id === state.connId; })) {
       state.connId = '';
     }
@@ -425,18 +424,18 @@
 
   async function loadTree() {
     if (!state.connId) { hint('先选一条连接', true); return; }
-    var seq = ++state.loadSeq;
+    var seq = ++state.treeSeq;
     hint('正在读取库列表…');
     try {
       var r = await req('/api/db/databases?conn_id=' + encodeURIComponent(state.connId));
-      if (seq !== state.loadSeq) return; // 期间切过连接/目标，丢弃
+      if (seq !== state.treeSeq) return; // 期间切过连接/目标，丢弃
       state.databases = r.databases || [];
       state.expanded = {};
       state.tables = {};
       renderTree();
       hint('共 ' + state.databases.length + ' 个库');
     } catch (e) {
-      if (seq !== state.loadSeq) return;
+      if (seq !== state.treeSeq) return;
       hint('读取库列表失败：' + e.message, true);
     }
   }
@@ -497,14 +496,14 @@
       state.expanded[db] = true;
       renderTree();
       if (!state.tables[db]) {
-        var seq = state.loadSeq;
+        var seq = state.treeSeq;
         try {
           var r = await req('/api/db/tables?conn_id=' + encodeURIComponent(state.connId) + '&db=' + encodeURIComponent(db));
           // 期间切过连接就丢弃：否则会把旧连接的表塞进新连接的树里
-        if (seq !== state.loadSeq) return;
+        if (seq !== state.treeSeq) return;
           state.tables[db] = r.tables || [];
         } catch (err) {
-        if (seq !== state.loadSeq) return;
+        if (seq !== state.treeSeq) return;
           state.tables[db] = [];
           hint('读取表列表失败：' + err.message, true);
         }

@@ -75,6 +75,9 @@ func Alive(c *ssh.Client) bool {
 	if c == nil {
 		return false
 	}
+	// 请求放在一个带缓冲的 channel 上，超时后 goroutine 仍会写进去然后自然结束
+	// （缓冲 1，不会阻塞发送）。注意它可能还卡在 x/crypto 的 globalSentMu 上，
+	// 那种情况下它会一直挂着 —— 这是"探活超时"的固有代价，不影响连接本身。
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
