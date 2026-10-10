@@ -624,6 +624,8 @@ func openStore(t *testing.T, base string) *store.Store {
 		t.Fatalf("打开库失败: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// 先关库再让 mkTempDir 删目录：不关的话 SQLite 文件句柄会让 Windows 拒绝删除
+	t.Cleanup(func() { _ = st.Close() })
 	return st
 }
 
