@@ -628,8 +628,50 @@ async function renderHostKeyInfo(targetID) {
       refreshHistory();
     }).catch(function (e) {
       setStatus('连接失败：' + e.message);
-      window.AwdToast.error('连接失败\n\n' + e.message);
+      // 防御：toast.js 万一没加载，不能把真实错误再吞一次（原来这里会抛
+      // "Cannot read properties of undefined"，把"连接为什么失败"彻底盖住）
+      if (window.AwdToast && window.AwdToast.error) {
+        window.AwdToast.error('连接失败\n\n' + e.message);
+      } else {
+        console.error('连接失败：' + e.message);
+      }
     });
+  }
+
+  // showTermMenu 是一个极简的右键菜单：只有剪贴板三项，不需要通用组件。
+  var termMenuEl = null;
+  function showTermMenu(x, y, items) {
+    if (termMenuEl) { termMenuEl.remove(); termMenuEl = null; }
+    var menu = document.createElement("div");
+    menu.className = "term-menu";
+    menu.style.left = x + "px";
+    menu.style.top = y + "px";
+    items.forEach(function (it) {
+      var row = document.createElement("div");
+      row.className = "term-menu-item" + (it.enabled === false ? " disabled" : "");
+      row.textContent = it.label;
+      row.addEventListener("mousedown", function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (it.enabled === false) return;
+        it.run();
+        if (termMenuEl) { termMenuEl.remove(); termMenuEl = null; }
+      });
+      menu.appendChild(row);
+    });
+    document.body.appendChild(menu);
+    termMenuEl = menu;
+    var close = function () {
+      if (termMenuEl) { termMenuEl.remove(); termMenuEl = null; }
+      document.removeEventListener("mousedown", close, true);
+      document.removeEventListener("keydown", close, true);
+      window.removeEventListener("blur", close);
+    };
+    setTimeout(function () {
+      document.addEventListener("mousedown", close, true);
+      document.addEventListener("keydown", close, true);
+      window.addEventListener("blur", close);
+    }, 0);
   }
 
   function openTerminal(handle) {
@@ -650,6 +692,80 @@ async function renderHostKeyInfo(targetID) {
     });
     var fit = new window.FitAddon.FitAddon();
     term.loadAddon(fit);
+
+    // ── 剪贴板 ──────────────────────────────────────────────
+    // xterm 的默认行为是「Ctrl+C 一律发 SIGINT 给远端」，选中了文本也没法复制 ——
+    // 唯一的复制入口变成鼠标拖选之后没有任何快捷键（用户报的就是这个）。
+    // 这里补上 Windows Terminal / PuTTY 那套习惯：
+    //   按键分配照 Linux 终端惯例，**不动 Ctrl+C**：
+    //     Ctrl+Shift+C / Ctrl+Insert   -> 复制
+    //     Ctrl+Shift+V / Shift+Insert  -> 粘贴（裸 Ctrl+V 交给浏览器默认 paste）
+    //     Ctrl+C                       -> 永远放行，仍是 SIGINT（有选区也不抢）
+    //     Ctrl+A                       -> 不拦，shell 里它是「移到行首」
+    //   全选、复制、粘贴也在终端右键菜单里
+    function copySelection(text) {
+      if (!text) return false;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(function () { legacyCopy(text); });
+      } else {
+        legacyCopy(text);
+      }
+      return true;
+    }
+    // WebView2 里 navigator.clipboard 在部分场景会拒绝（权限/焦点），留一条老路
+    function legacyCopy(text) {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (e) { /* 两条路都不行就只能算了 */ }
+      document.body.removeChild(ta);
+    }
+    function pasteFromClipboard() {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+      navigator.clipboard.readText().then(function (txt) {
+        if (txt) term.paste(txt);
+      }).catch(function () { /* 读不到就让用户用 Ctrl+Shift+V 或鼠标中键 */ });
+      }
+    }
+
+    var termKeyHandler = function (e) {
+      if (e.type !== "keydown") return true;
+      var ctrl = e.ctrlKey || e.metaKey;
+      var key = e.key;
+
+      // **Ctrl+C 永远放行**：它是 SIGINT，有选区残留时也要能中断命令。
+      // 复制一律走 Ctrl+Shift+C（Linux 终端惯例），Ctrl+Insert 作为老习惯保留。
+      if (ctrl && e.shiftKey && (key === "c" || key === "C")) {
+        var sel = term.getSelection();
+        if (sel) { copySelection(sel); return false; }
+        return false;   // 没选区也拦，免得 Shift+Ctrl+C 被当成别的组合发下去
+      }
+      if (e.ctrlKey && key === "Insert") {
+        var sel2 = term.getSelection();
+        if (sel2) { copySelection(sel2); return false; }
+        return true;
+      }
+      // 粘贴：Ctrl+Shift+V / Shift+Insert。
+      // 裸 Ctrl+V 交给浏览器默认的 paste 事件（xterm 自己会处理），不要拦。
+      if ((ctrl && e.shiftKey && (key === "v" || key === "V")) || (e.shiftKey && key === "Insert")) {
+        pasteFromClipboard();
+        return false;
+      }
+      // 注意：**不要拦 Ctrl+A** —— shell 里它是「光标移到行首」，很重要的编辑键。
+      // 全选走右键菜单。
+      return true;
+    };
+    // 防御：vendored xterm 换版本、或测试替身没实现这个方法时，不能让
+    // "注册一个快捷键"把整条连接路径带崩（openTerminal 抛错会进 connect 的 catch）。
+    if (typeof term.attachCustomKeyEventHandler === "function") {
+      term.attachCustomKeyEventHandler(termKeyHandler);
+    }
+
 
     var host = document.createElement('div');
     host.className = 'term-host';
@@ -673,6 +789,16 @@ async function renderHostKeyInfo(targetID) {
     host.appendChild(head);
     host.appendChild(body);
     el.termArea.appendChild(host);
+    // 右键菜单：WebView2 的系统菜单里没有剪贴板项，自己给三个常用动作
+    body.addEventListener("contextmenu", function (ev) {
+      ev.preventDefault();
+      var hasSel = !!term.getSelection();
+      showTermMenu(ev.clientX, ev.clientY, [
+        { label: "复制", enabled: hasSel, run: function () { copySelection(term.getSelection()); } },
+        { label: "粘贴", run: pasteFromClipboard },
+        { label: "全选", run: function () { if (term.selectAll) term.selectAll(); } }
+      ]);
+    });
 
     // 同一台主机开多个会话时标题完全一样，标签栏上分不清谁是谁，第二个起加序号
     var baseTitle = handle.title;

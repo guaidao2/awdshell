@@ -110,6 +110,9 @@ function createEnv(extra) {
     CustomEvent: function (t, o) { this.type = t; this.detail = o && o.detail; },
     localStorage: { getItem() { return null; }, setItem() { } },
     confirm: () => true,
+      // toast 替身：被测代码里到处是 window.AwdToast.xxx，缺了它会让
+      // catch 分支自己抛错、把真实失败原因盖住
+      AwdToast: { error() { }, warn() { }, info() { }, ok() { } },
     AbortController: function () { this.signal = {}; this.abort = function () { }; },
     WebSocket: mkWebSocketClass(sockets),
     Terminal: function () { const t = mkTerminal(); terminals.push(t); return t; },

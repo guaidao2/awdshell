@@ -2292,3 +2292,21 @@ th, .fb-head { font-variant-numeric: tabular-nums; }
 .cp-hist-head { display: flex; align-items: center; gap: 8px; }
 .cp-hist-head .cp-hist-clear { margin-left: auto; }
 .cp-hist-del { flex: none; }
+/* 终端右键菜单：只放剪贴板三项 */
+.term-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 108px;
+  padding: 4px 0;
+  background: #1b2029;
+  border: 1px solid #2c3442;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+  font-size: 13px;
+  color: #e6eaf2;
+  user-select: none;
+}
+.term-menu-item { padding: 6px 14px; cursor: default; white-space: nowrap; }
+.term-menu-item:hover { background: #2a323e; }
+.term-menu-item.disabled { color: #6b7480; }
+.term-menu-item.disabled:hover { background: transparent; }
