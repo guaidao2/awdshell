@@ -49,7 +49,7 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 // nowMillis 返回当前毫秒时间戳（跨边界时间戳统一用毫秒）。
 func nowMillis() int64 { return time.Now().UnixMilli() }
