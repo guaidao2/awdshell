@@ -812,11 +812,18 @@ async function renderHostKeyInfo(targetID) {
     term.open(body);
 
     pclose.addEventListener('click', function (e) { e.stopPropagation(); closeTab(s.id); });
-    // 点哪一格哪一格就成为当前会话（已经是当前的就不重复处理）
-    host.addEventListener('mousedown', function () {
-      if (state.active !== s.id) activate(s.id);
-    });
-
+      // 点哪一格哪一格就成为当前会话（已经是当前的就不重复处理）。
+      //
+      // **必须用 capture 阶段（第三个参数 true）**：xterm 内部那层输入元素会在冒泡阶段
+      // stopPropagation，挂普通监听时「点终端区域」压根收不到事件 —— 分屏下点第二格
+      // 不会切换当前会话，于是文件面板的「跟随当前会话」看起来跟的是第一格。
+      host.addEventListener('mousedown', function () {
+        if (state.active !== s.id) activate(s.id);
+      }, true);
+      // focusin 兜住不经 mousedown 的路径：Tab 切焦点、点标题栏空白等。
+      host.addEventListener('focusin', function () {
+        if (state.active !== s.id) activate(s.id);
+      }, true);
     openWS(s, handle.ws_token);
 
     term.onData(function (d) {
