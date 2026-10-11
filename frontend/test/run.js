@@ -319,6 +319,65 @@ async function caseTermKeyHandler() {
   check('Ctrl+Shift+C 也拦了默认行为（浏览器会当"打开开发者工具"）', evCopy.defaultPrevented === true);
 }
 
+// ---------- 布局变化后终端要重新适配 ----------
+//
+// 症状（作者实测）：点「监控」，右侧面板出现、终端被挤窄，但**文字不换行**
+//（列数没跟着更新）；点「文件面板」却会重排。
+//
+// 根因：终端可用宽度变了，而这些变化**不触发 window 的 resize 事件**。原先的做法
+// 是让每个面板自己在显隐后派发 resize —— 全仓 9 处显隐点里只有 3 处派了
+//（监控面板、日志检测、基线核查、分屏切换都没派），所以补一处还会漏下一处。
+//
+// 修法：终端对自己的容器挂 ResizeObserver，宽度一变就重排，与"谁改的布局"无关。
+async function casePaneRefit() {
+  console.log('--- 布局变化）容器宽度变了要重新适配终端 ---');
+  const env = createEnv();
+  env.sandbox.fetch = async function (url) {
+    const u = String(url);
+    let body = {};
+    if (u.indexOf('/api/settings') >= 0) body = {};
+    else if (u.indexOf('/api/targets') >= 0) body = [{ id: 't1', name: 'A', host: 'h', port: 22, username: 'u' }];
+    else if (u.indexOf('/api/recent') >= 0) body = [];
+    else if (u.indexOf('/api/history') >= 0) body = [];
+    else if (u.indexOf('/api/files/startdir') >= 0) body = { path: '', source: 'none' };
+    else if (u.indexOf('/api/sessions') >= 0) body = { session_id: 's1', target_id: 't1', title: 'A', ws_token: 'tok1' };
+    return ok(body);
+  };
+  env.load('app.js');
+  await env.sleep(30);
+  env.el('sidebar-body').fire('click', { target: { closest: () => ({ dataset: { act: 'connect', id: 't1' } }) } });
+  await env.sleep(30);
+
+  check('终端容器挂了 ResizeObserver', env.resizeObservers.length >= 1, env.resizeObservers.length);
+  const ro = env.resizeObservers[0];
+  if (!ro) return;
+  check('观察的是终端自己的容器', ro.targets.length === 1, ro.targets.length);
+
+  const pane = ro.targets[0];
+  // 先让会话建立路径上那几处 safeFit（渲染完成、初始目录回填）落定，
+  // 否则"这一次变化到底重排了没有"会被它们干扰。
+  await env.sleep(250);
+  const before = env.fits.length;
+
+  // 被整页视图盖住：宽高为 0，这时 fit 会算出无意义的行列数，必须跳过
+  pane.clientWidth = 0; pane.clientHeight = 0;
+  ro.trigger();
+  await env.sleep(120);
+  check('容器不可见时不重排', env.fits.length === before, env.fits.length - before);
+
+  // 右侧面板出现 → 容器变窄 → 必须重排（这就是"点监控不换行"那条）
+  pane.clientWidth = 800; pane.clientHeight = 600;
+  ro.trigger();
+  await env.sleep(120);
+  check('容器宽度变化后重新适配终端', env.fits.length > before, env.fits.length - before);
+
+  // 拖动分隔条时回调是高频的：必须去抖，不能每个回调都 fit 一次
+  const mid = env.fits.length;
+  ro.trigger(); ro.trigger(); ro.trigger();
+  await env.sleep(120);
+  check('连续多次变化被去抖成一次', env.fits.length === mid + 1, env.fits.length - mid);
+}
+
 (async () => {
   try {
     await caseWsGuard();
@@ -328,6 +387,7 @@ async function caseTermKeyHandler() {
     await caseLogscanEscape();
     await caseReqConsistency();
     await caseTermKeyHandler();
+    await casePaneRefit();
   } catch (e) {
     console.log('  FAIL harness error: ' + (e && e.stack || e));
     fails++;

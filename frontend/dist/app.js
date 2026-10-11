@@ -850,6 +850,26 @@ async function renderHostKeyInfo(targetID) {
     state.sessions.push(s);
     term.open(body);
 
+    // 终端可用宽度会随「右侧面板显隐 / 拖动分隔条 / 分屏布局」变化，而这些变化
+    // **都不会触发 window 的 resize 事件**。只靠各个面板自己记得派发 resize 会漏 ——
+    // 实测：打开监控面板时终端不重排（文字不换行，看着被挤窄），打开文件面板才会；
+    // 全仓 9 处显隐点里只有 3 处派了 resize（日志检测 / 基线核查 / 分屏切换都没派）。
+    // 这里让终端盯着自己的容器：宽度一变就重新适配，覆盖所有来源，
+    // 将来再加面板也不必记得派事件。
+    if (typeof ResizeObserver === "function") {
+      var fitTimer = 0;
+      s.ro = new ResizeObserver(function () {
+        if (fitTimer) clearTimeout(fitTimer);
+        // 去抖：拖动分隔条时回调是高频的，每次都 fit 会抖。
+        fitTimer = setTimeout(function () {
+          // 被整页视图盖住时容器宽高为 0，这时 fit 会算出无意义的行列数，跳过。
+          if (!body.clientWidth || !body.clientHeight) return;
+          safeFit(s);
+        }, 60);
+      });
+      s.ro.observe(body);
+    }
+
     pclose.addEventListener('click', function (e) { e.stopPropagation(); closeTab(s.id); });
       // 点哪一格哪一格就成为当前会话（已经是当前的就不重复处理）。
       //
@@ -927,6 +947,7 @@ async function renderHostKeyInfo(targetID) {
     s.closing = true; // 用户主动关闭，不要触发自动重连
     api.closeSession(id).catch(function () { /* 可能已自然结束 */ });
     try { if (s.ws) s.ws.close(); } catch (e) { /* 忽略 */ }
+    if (s.ro) { s.ro.disconnect(); s.ro = null; }
     s.term.dispose();
     s.host.remove();
     state.sessions.splice(i, 1);

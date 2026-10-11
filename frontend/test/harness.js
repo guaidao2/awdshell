@@ -6,7 +6,11 @@
    都验不出来，只能真的把脚本跑起来。
 
    这里造一个最小替身：按 id 现取的假元素、一个假 WebSocket、一个可编程的 fetch。
-   够跑 app.js / monitor.js / logscan.js / compliance.js 的渲染与消息路径。 */
+   够跑 app.js / monitor.js / logscan.js / compliance.js 的渲染与消息路径。
+
+   一条经验（踩过两次）：被测代码里凡是有 `typeof X === "function"` 这类
+   "环境不支持就跳过"的守卫，替身就必须实现 X —— 否则守卫把测试也一起跳过了，
+   那条路径在测试里是空白的，bug 会直接进发布版。 */
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -22,6 +26,9 @@ function mkEl(id) {
     id, tagName: 'DIV', _html: '', textContent: '', value: '', hidden: true, checked: false,
     disabled: false, title: '', className: '', selectedIndex: 0, options: [], children: [],
     parentNode: null, scrollTop: 0, scrollLeft: 0, style: {}, dataset: {},
+    // 容器尺寸：app.js 的 ResizeObserver 回调会看这两个值决定要不要重排，
+    // 默认给 0 表示"不可见"（用例可以按需要改写）。
+    clientWidth: 0, clientHeight: 0,
     classList: {
       _s: {},
       add(c) { this._s[c] = 1; },
@@ -59,7 +66,10 @@ function mkTerminal() {
     written: [],
     // 记下通过 term.paste() 粘进来的内容（终端快捷键的粘贴路径走这里）
     pasted: [],
-    open() { }, dispose() { }, loadAddon() { }, focus() { },
+    // open 记下容器：app.js 在 term.open(body) 之后给这个容器挂 ResizeObserver，
+    // 用例要拿到它才能模拟"容器宽度变了"。
+    open(el) { this._openEl = el; },
+    dispose() { }, loadAddon() { }, focus() { },
     write(b) { this.written.push(String(b)); },
     onData(f) { this._data = f; },
     onResize(f) { this._resize = f; },
@@ -98,6 +108,30 @@ function mkWebSocketClass(sockets) {
   return FakeWS;
 }
 
+// 假 FitAddon：只记调用次数（app.js 的 safeFit 调的就是 fit.fit()）。
+function mkFitAddonClass(fits) {
+  function FitAddon() { this.fit = function () { fits.push(1); }; }
+  return { FitAddon };
+}
+
+// 假 ResizeObserver：记下回调与观察目标，用例用 trigger() 手动触发。
+//
+// 为什么必须有：app.js 用 `typeof ResizeObserver === "function"` 守卫后注册，
+// harness 没有它时注册会被静默跳过 —— "容器宽度变了要重排"这条就完全测不到
+// （同一个坑已经让终端快捷键的 handler 在测试里空白过一轮）。
+function mkResizeObserverClass(observers) {
+  function FakeRO(fn) {
+    this.fn = fn;
+    this.targets = [];
+    this.disconnected = false;
+    observers.push(this);
+  }
+  FakeRO.prototype.observe = function (el) { this.targets.push(el); };
+  FakeRO.prototype.disconnect = function () { this.disconnected = true; this.targets = []; };
+  FakeRO.prototype.trigger = function () { if (!this.disconnected) this.fn([], this); };
+  return FakeRO;
+}
+
 function ok(body) {
   return { ok: true, status: 200, statusText: 'OK', json: async () => body };
 }
@@ -109,6 +143,8 @@ function createEnv(extra) {
   const docListeners = {};
   const sockets = [];
   const terminals = [];
+  const fits = [];            // 每次 FitAddon.fit() 记一次
+  const resizeObservers = []; // ResizeObserver 替身集合
 
   const sandbox = {
     console, setTimeout, clearTimeout, setInterval, clearInterval,
@@ -127,7 +163,8 @@ function createEnv(extra) {
     AbortController: function () { this.signal = {}; this.abort = function () { }; },
     WebSocket: mkWebSocketClass(sockets),
     Terminal: function () { const t = mkTerminal(); terminals.push(t); return t; },
-    FitAddon: { FitAddon: function () { this.fit = function () { }; } },
+    FitAddon: mkFitAddonClass(fits),
+    ResizeObserver: mkResizeObserverClass(resizeObservers),
     fetch: function () { throw new Error('这个用例没有装 fetch 替身'); },
     document: {
       readyState: 'complete',
@@ -158,7 +195,7 @@ function createEnv(extra) {
 
   const ctx = vm.createContext(sandbox);
   return {
-    sandbox, el, els, sockets, terminals,
+    sandbox, el, els, sockets, terminals, fits, resizeObservers,
     load(f) { vm.runInContext(fs.readFileSync(path.join(DIST, f), 'utf8'), ctx, { filename: f }); },
     dispatch(type, detail) { sandbox.dispatchEvent(new sandbox.CustomEvent(type, { detail })); },
     sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
