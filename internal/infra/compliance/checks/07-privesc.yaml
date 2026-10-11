@@ -32,12 +32,21 @@ checks:
     category: 提权风险
     severity: critical
     refs: ["等保 8.1.4.2 访问控制", "sudo 提权"]
-    command: "grep -rhE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -E '(bash|/sh|dash|zsh|su|python|perl|ruby|php|find|vim|vi|less|more|awk|sed|env|nmap|tar|cp|mv|chmod|chown|dd|gdb|tee|systemctl|docker)' | head -n 10"
+    # 两个 grep 合成一个（原来 `... | grep ... | head -n 10`）：管道收尾会把
+    # grep 的 EACCES 退出码（2）换成 head 的 0，非 root 登录时这条 **critical**
+    # 检查会静默报"符合"。这里用 -m 限量、不用管道。
+    #
+    # 再加自报可读性 + `|| true`（复审 中2）：grep 无匹配退出 1 时 RunOutput
+    # 返回 ExitError，判定端在 err != nil 处就返回 error —— 干净 + root 的机器上
+    # 这一条也从来没 pass 过。pattern `\S` 是"有输出就不合规"，
+    # __AWD_READ_OK__ / __AWD_READ_DENIED__ 两行由判定端摘掉，不会被当成发现。
+    command: "if [ -r /etc/sudoers ] && { [ ! -e /etc/sudoers.d ] || [ -r /etc/sudoers.d ]; }; then grep -rhE -m 10 '^[^#]*NOPASSWD.{0,200}(bash|/sh|dash|zsh|su|python|perl|ruby|php|find|vim|vi|less|more|awk|sed|env|nmap|tar|cp|mv|chmod|chown|dd|gdb|tee|systemctl|docker)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true; echo __AWD_READ_OK__; else echo __AWD_READ_DENIED__; fi"
     expect:
       type: regex_not_match
       pattern: '\S'
     remedy: "取消这些条目的 NOPASSWD，或收紧到具体的固定参数。免密执行上述任一程序都等价于免密 root —— 例如 sudo find / -exec sh \\; 。"
-    note: "普通命令（如 systemctl restart nginx）的 NOPASSWD 通常是有意为之，不在这条清单里。"
+    note: "普通命令（如 systemctl restart nginx）的 NOPASSWD 通常是有意为之，不在这条清单里。非 root 登录时读不到 sudoers，结果会标成「需 root」。"
+    needs_root: true
 
   - id: CHK-PE-003
     title: "计划任务与 systemd 单元不可被普通用户改写"
@@ -79,12 +88,18 @@ checks:
     category: 提权风险
     severity: high
     refs: ["等保 8.1.4.2 访问控制", "环境变量提权"]
-    command: "grep -rhE 'env_keep|env_reset|secure_path' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -n 10"
+    # 同上：去掉管道收尾，否则非 root 登录时这条 high 检查会把 EACCES 当成
+    # "读到了、是空的"，静默报"符合"。
+    # 复审 中2：再加自报可读性 + `|| true`（grep 无匹配退出 1 会让判定端在
+    # err != nil 处提前返回，"需要 root"的兜底永远不会执行）；
+    # pattern 里同时认 __AWD_READ_DENIED__，作为判定端那层处理的**双保险**。
+    command: "if [ -r /etc/sudoers ] && { [ ! -e /etc/sudoers.d ] || [ -r /etc/sudoers.d ]; }; then grep -rhE -m 10 'env_keep|env_reset|secure_path' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true; echo __AWD_READ_OK__; else echo __AWD_READ_DENIED__; fi"
     expect:
       type: regex_not_match
-      pattern: '(?i)env_keep[^\n]*(LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|PERL5LIB|RUBYLIB|NODE_PATH|GEM_PATH)'
+      pattern: '(?i)(__AWD_READ_DENIED__|env_keep[^\n]*(LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|PERL5LIB|RUBYLIB|NODE_PATH|GEM_PATH))'
     remedy: "去掉 sudoers 里对这些变量的 env_keep 保留。保留 LD_PRELOAD 后，任何能 sudo 的账号都可以加载自定义库并以 root 执行代码。"
-    note: "同时建议确认配置了 default env_reset 与 secure_path。"
+    note: "同时建议确认配置了 default env_reset 与 secure_path。非 root 登录时读不到 sudoers，结果会标成「需 root」。"
+    needs_root: true
 
   - id: CHK-PE-007
     title: "无普通用户处于 docker 等高权限组"

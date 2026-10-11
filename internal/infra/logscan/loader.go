@@ -137,6 +137,102 @@ type yamlTest struct {
 	Negative []string `yaml:"negative"`
 }
 
+// maxAnyOfDepth 限制 anyOf 的嵌套层数。
+// YAML 本身允许无限嵌套，递归展开时要有底 —— 一份深到几千层的规则文件
+// 不该把加载器拖进栈溢出。
+const maxAnyOfDepth = 8
+
+// compileAnyOfSub 把 anyOf 的一个子算子编译成正则片段（递归）。
+//
+// 为什么子算子也要走完整校验：审计实测 `- name: detectXSS`（任何非 regex/pm 的
+// 名字）会被静默丢掉 —— 规则 loaded=1、skipped 为空，只记进内部的
+// UnknownOperators（按设计不打日志、不上界面），合成出来的正则里根本没有它，
+// 于是那条规则"看着加载了、其实不覆盖"。子算子里多写的参数
+// （`regex + min_depth: 3`）同样会被静默忽略，而顶层写同一个参数是会被拒的。
+//
+// 取法：子算子名必须在本版本已实现的算子表里（operatorParamAllow），
+// 参数逐个过白名单；遇到不支持的**整条规则**跳过，不做静默降级。
+func compileAnyOfSub(op yamlOperator, depth int) ([]string, error) {
+	if depth > maxAnyOfDepth {
+		return nil, fmt.Errorf("anyOf 嵌套超过 %d 层", maxAnyOfDepth)
+	}
+	name := strings.TrimSpace(op.Name)
+	lower := strings.ToLower(name)
+	if name == "" {
+		return nil, fmt.Errorf("anyOf 里有一个子算子没写 name")
+	}
+	if _, known := operatorParamAllow[lower]; !known {
+		// 仍然记进内部注册表（诊断用），但这里不再放行整条规则
+		recordUnknownOperator(name)
+		return nil, fmt.Errorf("anyOf 子算子 %q 本版本不支持", name)
+	}
+	if bad := firstUnknownParam(lower, op.Params); bad != "" {
+		return nil, fmt.Errorf("anyOf 子算子 %s 不支持参数 %q", lower, bad)
+	}
+	switch lower {
+	case "regex":
+		p := strings.TrimSpace(op.Params.Pattern)
+		if p == "" {
+			return nil, fmt.Errorf("anyOf 子算子 regex 没有 pattern")
+		}
+		return []string{"(?:" + p + ")"}, nil
+	case "pm":
+		var parts []string
+		for _, kw := range op.Params.Patterns {
+			if kw = strings.TrimSpace(kw); kw != "" {
+				parts = append(parts, "(?:"+regexp.QuoteMeta(kw)+")")
+			}
+		}
+		if len(parts) == 0 {
+			return nil, fmt.Errorf("anyOf 子算子 pm 没有 patterns")
+		}
+		return parts, nil
+	case "anyof":
+		var parts []string
+		if len(op.Params.Operators) == 0 {
+			return nil, fmt.Errorf("anyOf 子算子 anyOf 里没有子算子")
+		}
+		for _, sub := range op.Params.Operators {
+			ps, err := compileAnyOfSub(sub, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, ps...)
+		}
+		return parts, nil
+	default:
+		// 语义算子（detectXSS / detectSQLi …）是"再来一遍文本扫描"的函数，
+		// 合成不进这一条正则里。要么支持、要么拒绝，不能假装加载了。
+		return nil, fmt.Errorf("anyOf 子算子 %q 是语义算子，无法合成正则（请拆成独立规则）", name)
+	}
+}
+
+// unknownChainSteps 返回规则里写了、但本版本没实现的变换名（保持书写顺序、去重）。
+//
+// 用途：ChainFromNames 会把它们跳掉并记进内部注册表，规则照常加载 ——
+// 调用方（界面、启动日志）看不到任何异常，属于"写了但不生效"的静默降级。
+// 审计要求这类项也出现在 LoadReport.Skipped 里，能被看见。
+func unknownChainSteps(requested, used []string) []string {
+	if len(requested) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(used))
+	for _, n := range used {
+		known[n] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, n := range requested {
+		name := strings.TrimSpace(n)
+		if name == "" || known[name] || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
 // LoadedRule 是规则本体加上它自带的测试样本。
 type LoadedRule struct {
 	Rule
@@ -242,6 +338,13 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 
 	var out []LoadedRule
 	var skipped []string
+	// seenIDs 是**已经加载成功**的规则 id。
+	//
+	// 为什么需要：同 id 的两条规则过去都会 loaded，于是同一条规则在
+	// BySeverity / 落库 / 态势统计里算两遍（同一次扫描的命中翻倍）。
+	// 只把"真正进了 out 的 id"算占用：若第一条因参数错误被跳过、第二条是好的，
+	// 第二条应当正常加载（用前置 seen 判定会把好规则一起丢掉）。
+	seenIDs := map[string]bool{}
 
 	for _, yr := range doc.Rules {
 		id := strings.TrimSpace(yr.ID)
@@ -318,26 +421,22 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 			}
 
 		case "anyof":
-			// anyOf：任一子算子命中即算命中。子算子目前支持 regex 与 pm，
-			// 统一合成一条 OR 正则（SSTI 那条规则就是这么写的）。
+			// anyOf：任一子算子命中即算命中，统一合成一条 OR 正则
+			// （SSTI 那条规则就是这么写的）。
+			// 子算子递归编译 + 逐参数校验，遇到不支持的整条跳过（见 compileAnyOfSub）。
 			var parts []string
+			subFailed := false
 			for _, sub := range yr.Operator.Params.Operators {
-				switch strings.ToLower(strings.TrimSpace(sub.Name)) {
-				case "regex":
-					if p := strings.TrimSpace(sub.Params.Pattern); p != "" {
-						parts = append(parts, "(?:"+p+")")
-					}
-				case "pm":
-					for _, kw := range sub.Params.Patterns {
-						if kw = strings.TrimSpace(kw); kw != "" {
-							parts = append(parts, "(?:"+regexp.QuoteMeta(kw)+")")
-						}
-					}
-				default:
-					if n := strings.TrimSpace(sub.Name); n != "" {
-						recordUnknownOperator(n)
-					}
+				ps, err := compileAnyOfSub(sub, 1)
+				if err != nil {
+					skipped = append(skipped, fmt.Sprintf("%s(%s): %v", id, source, err))
+					subFailed = true
+					break
 				}
+				parts = append(parts, ps...)
+			}
+			if subFailed {
+				continue
 			}
 			if len(parts) == 0 {
 				skipped = append(skipped, fmt.Sprintf("%s(%s): anyOf 里没有可用的子算子", id, source))
@@ -372,6 +471,13 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 		}
 
 		chain, chainNames := ChainFromNames(yr.Transforms)
+		// 没实现的变换名只进内部注册表、规则照常加载 —— 那是"写了但不生效"的
+		// 静默降级。审计要求这类项也进 Skipped，让它至少能被看见。
+		if unk := unknownChainSteps(yr.Transforms, chainNames); len(unk) > 0 {
+			skipped = append(skipped, fmt.Sprintf(
+				"%s(%s): 变换 %s 本版本未实现，该步骤被跳过（规则仍加载，但可能漏检这类编码）",
+				id, source, strings.Join(unk, ", ")))
+		}
 		// 没写 transforms 的规则套默认链。CompileRules 的注释一直这么承诺，
 		// 但 ChainFromNames(nil) 返回的是**非 nil 空切片**，`len(chain) == 0`
 		// 这个条件从来没被满足过 —— 这类规则会拿到空链、在原始文本上匹配。
@@ -382,6 +488,12 @@ func LoadRules(data []byte, source string) ([]LoadedRule, []string, error) {
 		rule.Chain = chain
 		rule.TransformNames = chainNames
 		rule.compile()
+
+		if seenIDs[id] {
+			skipped = append(skipped, fmt.Sprintf("%s(%s): 规则 id 重复，后一条已忽略（避免同一条规则被算两遍）", id, source))
+			continue
+		}
+		seenIDs[id] = true
 
 		out = append(out, LoadedRule{
 			Rule:     rule,

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -29,24 +30,52 @@ type MonitorService struct {
 	last   map[string]collect.Snapshot
 	lastAt map[string]time.Time
 
-	// sampleMu 把同一目标的采样串起来。
+	// sampleLocks 把**同一个目标**的采样串起来（键是 targetID）。
 	//
 	// 为什么需要：监控面板刷新、切目标、手动点刷新都可能并发调 Sample，
 	// 而 CPU/速率全靠 last 与 lastAt 当基准 —— 两次并发采样会各自覆盖同一份
 	// 基准，算出来的百分比没有意义（差值区间与时间区间对不上）。
-	// 用 TryLock 而不是 Lock：并发时后到的那次直接返回"正在采样"，
+	// 用 TryLock 而不是 Lock：并发时后到的那次直接返回 ErrSampling，
 	// 而不是排队再采一遍（排队只会让界面更慢，数字也不会更准）。
-	sampleMu sync.Mutex
+	//
+	// **为什么是按目标而不是一把全局锁**（审计 M1）：一次采样最长约 27 秒
+	//（400ms 首次间隔 + 12s 拨号 + 15s 采集）。全局锁下 A 还在采的时候切到 B，
+	// B 拿到的是"上一次采样还没结束"，前端把它显示成红色的"采集失败"并停在
+	// A 的数字上 —— 实际 B 什么都没错，只是被 A 挡住了。
+	// 不同目标之间本来就没有共享状态（last/lastAt 都是按 targetID 分开的），
+	// 没有任何理由互相阻塞。
+	sampleLocks map[string]*sync.Mutex
 }
 
 // NewMonitorService 构造服务。
 func NewMonitorService(targets *TargetService, pool *sshx.Pool) *MonitorService {
 	return &MonitorService{
-		targets: targets,
-		pool:    pool,
-		last:    map[string]collect.Snapshot{},
-		lastAt:  map[string]time.Time{},
+		targets:     targets,
+		pool:        pool,
+		last:        map[string]collect.Snapshot{},
+		lastAt:      map[string]time.Time{},
+		sampleLocks: map[string]*sync.Mutex{},
 	}
+}
+
+// ErrSampling 表示"这个目标上一次采样还没结束"。
+//
+// 为什么单独给一个错误值：它是**并发拒绝**，不是采集失败。以前它与真实的
+// 采集错误共用一条路径，控制面一律回 502，界面画成红色的"采集失败" ——
+// 用户在 A、B 之间切一下就看到一句假故障，而 B 其实一点问题都没有。
+// 控制面据此回 409（"跳过这一轮"），前端不会把它当成故障。
+var ErrSampling = errors.New("这个目标的上一次采样还没结束，请稍候再试")
+
+// lockFor 取某个目标的采样锁（懒建）。s.mu 保护这张表本身。
+func (s *MonitorService) lockFor(targetID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lk := s.sampleLocks[targetID]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		s.sampleLocks[targetID] = lk
+	}
+	return lk
 }
 
 // NetRate 网卡速率（字节/秒）与累计量。
@@ -116,10 +145,12 @@ type Metric struct {
 
 // Sample 采集一次；首次调用会补采一次以便算出 CPU 占用与网络速率。
 func (s *MonitorService) Sample(targetID string) (Metric, error) {
-	if !s.sampleMu.TryLock() {
-		return Metric{}, fmt.Errorf("上一次采样还没结束，请稍候再试")
+	// 只锁这一个目标：别的目标照采（见 sampleLocks 的说明）。
+	lk := s.lockFor(targetID)
+	if !lk.TryLock() {
+		return Metric{}, ErrSampling
 	}
-	defer s.sampleMu.Unlock()
+	defer lk.Unlock()
 
 	snap, err := s.rawSample(targetID)
 	if err != nil {
@@ -153,14 +184,36 @@ func (s *MonitorService) Sample(targetID string) (Metric, error) {
 // Forget 忘掉某个目标的采样基准。
 //
 // 为什么必须清：s.last 里存的是上一次的 CPU 时间片与网卡累计字节，
-// 目标删掉（或它的连接/凭据改了）之后这份数据不该继续留着 ——
-// 同一个 targetID 被重新添加回来时，会拿一个陈旧的基准去算 CPU 与速率，
-// 差值区间可能横跨几小时，画出来的百分比是假的。
-// 由 TargetService.Delete 通过钩子调用（见 MonitorService.Forget 的接线）。
+// 目标删掉（或它的主机/凭据改成另一台机器）之后这份数据不该继续留着 ——
+// 同一个 targetID 会拿一个陈旧基准去算 CPU 与速率，画出来的百分比是假的
+// （而且 First=false，界面把它当真实数值画出来，属于**错误数据**而非缺失数据）。
+// 接线在 main.go：删目标挂 AddOnDelete、**更新已有目标**挂 AddOnSave
+// （审计 H2 漏的就是 Save 这条路：编辑目标换一台机器时 Save 保留原 ID）。
 func (s *MonitorService) Forget(targetID string) {
 	s.mu.Lock()
 	delete(s.last, targetID)
 	delete(s.lastAt, targetID)
+	delete(s.sampleLocks, targetID)
+	s.mu.Unlock()
+}
+
+// HasBaselineForTest 报告某个目标是否还留着采样基准。
+//
+// 为什么导出：audit44 H2 的接线在 main.go，而 main 包测不了 service 的内部字段。
+// 这条只读探针让"Save 之后基准清掉了没有"能在包外断言（生产代码不用它）。
+func (s *MonitorService) HasBaselineForTest(targetID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.last[targetID]
+	return ok
+}
+
+// SeedBaselineForTest 塞一份假的采样基准（模拟"已经采过一次"）。
+func (s *MonitorService) SeedBaselineForTest(targetID string) {
+	s.mu.Lock()
+	s.last[targetID] = collect.Snapshot{}
+	s.lastAt[targetID] = time.Now()
+	s.sampleLocks[targetID] = &sync.Mutex{}
 	s.mu.Unlock()
 }
 

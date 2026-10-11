@@ -47,11 +47,14 @@
     if (el) el.textContent = msg;
   }
 
-  function hint(msg, isError) {
+  // level: 空 = 普通提示；'warn' = 需要留意（黄）；其它真值 = 失败（红）。
+  // 以前只有布尔 isError —— 但"结果不完整"既不是成功、也不该看起来像失败：
+  // 用红色会和"检测失败"混淆，可它又必须显眼，所以加中间态。
+  function hint(msg, level) {
     var el = $('ls-hint');
     if (!el) return;
     el.textContent = msg || '';
-    el.className = isError ? 'ls-hint error-text' : 'ls-hint';
+    el.className = 'ls-hint' + (level === 'warn' ? ' warn' : (level ? ' error-text' : ''));
   }
 
   async function req(path, init) {
@@ -60,7 +63,10 @@
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
       try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 忽略 */ }
-      throw new Error(msg);
+      // 各视图各有一份 req，统一把状态码挂在错误上，调用方才好按语义分支。
+      var lErr = new Error(msg);
+      lErr.status = res.status;
+      throw lErr;
     }
     return res.json();
   }
@@ -330,9 +336,18 @@
         '&kind=' + encodeURIComponent(state.kind), { method: 'POST' });
       renderResult(res);
       var kindLabel = res.kind === 'web' ? 'Web 日志规则集' : (res.kind === 'system' ? '系统日志规则集' : '全量规则集');
+      // 扫描有总时间预算（默认 20 秒）：超了会停在半途并如实标注，结果不完整。
+      // 这句必须显眼 —— 用户拿一份"只扫了一半"的结果当全量结论会误判。
+      var truncNote = res.truncated
+        ? '　【结果不完整】' + (res.truncated_reason || ('扫描到第 ' + (res.stopped_at_line || 0) + ' 行时中止，其余行未检测'))
+        : '';
+      if (res.dropped_hits) {
+        truncNote += '　另有 ' + res.dropped_hits + ' 条命中因超出上限未列出';
+      }
       hint('检测完成：' + kindLabel + '（' + res.rule_count + ' 条规则' + (res.kind_auto ? '，类型为自动判断' : '，类型为手动指定') +
-        '）　扫描 ' + res.scanned + ' 行，命中 ' + res.hit_line_count + ' 行 / ' + res.hits.length + ' 条');
-      setStatus('日志检测完成：' + state.path);
+        '）　扫描 ' + res.scanned + ' 行，命中 ' + res.hit_line_count + ' 行 / ' + res.hits.length + ' 条' + truncNote,
+        res.truncated ? 'warn' : '');
+      setStatus(res.truncated ? '日志检测完成（结果不完整）：' + state.path : '日志检测完成：' + state.path);
     } catch (e) {
       hint('检测失败：' + e.message, true);
       setStatus('日志检测失败：' + e.message);

@@ -17,6 +17,7 @@ import (
 	"path"
 	"regexp"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -278,7 +279,14 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 		//      写 action 就没校验方法 —— 于是 GET 能在目标库跑 SQL、能删远端文件；
 		//   2. Host/Origin 兜底对"本机 + 无 Origin"一律放行（isLocalHost("") 与
 		//      isAllowedOrigin("") 都返回 true），本机非浏览器进程连 Host 都不用带。
-		// 所以令牌是唯一的硬边界，它必须覆盖所有 /api/ 请求。
+		// 所以令牌必须覆盖所有 /api/ 请求。
+		//
+		// **但它的定位是"凭据门"，不是"进程门"**（审计 H1）：控制面监听
+		// 127.0.0.1，本机进程本来就在信任边界内 —— 它读得到 key.bin 与 SQLite，
+		// 也能 GET 下面那个不校验令牌的 /runtime.js 把令牌取走。令牌真正挡住的是
+		// **跨源网页**（别的页面读不到令牌）与**误连**（随机端口 + 令牌）；
+		// 想挡本机进程得换成本机进程读不到的凭据分发（如命名管道 + ACL），
+		// 当前 HTTP 形态做不到。别再把它当进程隔离写。
 		tokenOK := s.APIToken != "" && r.Header.Get("X-Awd-Token") == s.APIToken
 
 		// 静态资源与 /runtime.js 留在令牌之外：页面要先加载它们才能拿到令牌，
@@ -407,6 +415,36 @@ func decode(r *http.Request, v any) error {
 	return decodeLimit(r, v, maxBodyBytes)
 }
 
+// queryIntRange 读一个**带范围**的整数查询参数：**参数缺失（或只有空白）才用默认值**，
+// 给了却解析不出来、或超出 [min,max] 一律报错。
+//
+// 为什么不是 fmt.Sscanf 不判返回值（以前 threat.go 的 days 与 logscan.go 的
+// lines 就是这么写的）：`days=abc` 会静默落到默认值上，用户以为自己设了
+// 7 天以外的时间窗，实际拿到的是默认值，界面上没有任何提示。
+//
+// 为什么还要带范围（复审·低2）：只判"解析得出来吗"是不够的 —— 实测
+// `days=-1` 拿到 200，since 被算成**未来时刻**（1791078910037），态势页
+// 于是画出一个空窗口、还什么提示都没有；`lines=0` / `lines=-1` 则在 service
+// 里被静默换成默认的 2000 行，用户以为"我只扫了 1 行"。
+// 越界不是"用户想要别的数"，是**输入根本无意义**，必须 400 并说清范围。
+//
+// 两个接口共用一个实现，语义才不会各走各的（审计要求"两处口径一致"）。
+func queryIntRange(q url.Values, name string, def, min, max int) (int, error) {
+	v := strings.TrimSpace(q.Get(name))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, errText(fmt.Sprintf("%s 必须是整数（例如 %s=%d）", name, name, def))
+	}
+	if n < min || n > max {
+		return 0, errText(fmt.Sprintf("%s 超出允许范围（%d-%d）：%s=%d",
+			name, min, max, name, n))
+	}
+	return n, nil
+}
+
 // decodeLimit 带体积上限地解析请求体。
 //
 // 用 LimitReader 而不是 MaxBytesReader：后者需要 ResponseWriter，
@@ -501,6 +539,9 @@ func (s *Server) handleTargetByID(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case http.MethodPost: // 测试连接（只做认证探测）
+		if !s.requireSessions(w) {
+			return
+		}
 		if err := s.Sessions.TestConnection(id); err != nil {
 			writeErr(w, http.StatusBadGateway, err)
 			return
@@ -578,7 +619,27 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// requireSessions 在会话服务没注入时如实回一句"这个形态没有终端"。
+//
+// 为什么必须有：`s.Sessions` 为 nil 时（测试构造、或以后某个不启用终端的形态），
+// s.Sessions.Get / List / Attach 都会在 nil 上解引用，被 withCORS 的 recover
+// 兜成 500 "internal error" —— 用户看到的是"程序坏了"，而真实原因是服务没接上；
+// 日志里也只剩一段 panic 栈，排查要往回猜。
+//
+// 回 503（不是 404/403）：这是"本形态不提供该能力"，与会话/令牌对不对无关，
+// 对所有 id 都一致，不会变成存在性 oracle。
+func (s *Server) requireSessions(w http.ResponseWriter) bool {
+	if s.Sessions == nil {
+		http.Error(w, "会话服务未启用（当前形态不支持终端）", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSessions(w) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.Sessions.List())
@@ -604,6 +665,9 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSessions(w) {
+		return
+	}
 	rest := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
 	id := strings.TrimSuffix(rest, "/attach")
 
@@ -637,6 +701,11 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 
 // handleTerminalWS 是终端数据面：远端输出走二进制帧，键盘输入走 JSON 文本帧。
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
+	// 会话服务没注入时先如实拒绝：见 requireSessions 的说明
+	//（不判的话 s.Sessions.Get 会 nil 解引用，被 recover 兜成 500）。
+	if !s.requireSessions(w) {
+		return
+	}
 	id := strings.TrimPrefix(r.URL.Path, "/ws/term/")
 	// "会话不存在"与"令牌不对"必须回同一个 403。
 	//
@@ -749,7 +818,6 @@ func (s *Server) staticHandler() http.Handler {
 			http.NotFound(w, r)
 		})
 	}
-	fileServer := http.FileServer(http.FS(s.Assets))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 浏览器模式也要能拿到运行时配置：桌面形态由 Wails 的 AssetServer 中间件注入，
 		// 而 -web 走的是这里，缺了它前端会请求到 404，并把返回的 index.html 当 JS 解析。
@@ -765,24 +833,67 @@ func (s *Server) staticHandler() http.Handler {
 				s.APIBase, s.Version, s.APIToken)
 			return
 		}
+		// 先把请求路径解析成**一个确定的文件**，再交给 ServeFileFS。
+		//
+		// 为什么必须自己解析：http.FileServer 有两种情况会回 301 ——
+		//   1. 路径是个目录（HTTP 语义要求补上结尾斜杠）；
+		//   2. URL 以 /index.html 结尾（它跳到 ./）。
+		// 而 301 / 404 / 200 三种响应合起来就是一个"这个路径存不存在"的探针
+		// （审计实测：/index.html 或某个存在的目录回 301、不存在的回 404、文件回 200），
+		// 本机任意页面据此就能把静态资源目录结构问出来。
+		// 解析成具体文件之后，上面两种重定向都没有产生的余地。
 		p := strings.TrimPrefix(r.URL.Path, "/")
-		if p == "" {
-			p = "index.html"
+		// 去掉**全部**结尾斜杠后再解析：`/app.js/`、`/app.js//` 都是"把文件
+		// 当目录用"，多一个斜杠不能成为绕开下面那条 404 判据的出口。
+		// 同时记下"路径原本是不是以斜杠结尾"，文件那边要用它做判断。
+		trimmed := strings.TrimRight(p, "/")
+		trailingSlash := trimmed != p
+		file := trimmed
+		if file == "" {
+			file = "index.html"
+		} else if info, err := fs.Stat(s.Assets, file); err != nil {
+			// 不存在：交给下面的"404 还是 SPA 回退"判据
+			file = ""
+		} else if info.IsDir() {
+			// 目录：只认它下面的 index.html（不列目录、不补斜杠）。
+			// 找不到就当作"没有这个静态资源"—— 目录名与前端路由同名时（SPA 路由
+			// 不带扩展名）仍要走回退，所以这里不直接 404。
+			idx := file + "/index.html"
+			if d, err := fs.Stat(s.Assets, idx); err == nil && !d.IsDir() {
+				file = idx
+			} else {
+				file = ""
+			}
+		} else if trailingSlash {
+			// 走到这里说明：请求以 "/" 结尾，但解析出来是个**普通文件**
+			//（不是目录、也没有 index.html 可言）。
+			//
+			// 以前这条整块被跳过：`file` 已经被上面那个 else-if 设成了合法文件名，
+			// 下面 `if file == ""` 的扩展名检查根本不执行，`strings.TrimSuffix(p,"/")`
+			// 的兜底又只看 `p` 不看 `file` —— 于是 **`GET /app.js/` 回 200 +
+			// app.js 正文**（复审实测 51443 字节）、`GET /index.html/` 同样 200。
+			// 既然目录语义在这里不成立，就不要回正文，直接 404。
+			http.NotFound(w, r)
+			return
 		}
-		if _, err := fs.Stat(s.Assets, p); err != nil {
+		if file == "" {
 			// 静态扩展名缺失时就该 404：SPA 回退只服务"前端路由"，
 			// 不能把缺的 .js/.css 回成 index.html 200（见 staticAssetExts）。
 			//
-			// 先去掉结尾斜杠再取扩展名：`path.Ext("foo.js/")` 是空串
+			// 取扩展名用去掉结尾斜杠的 trimmed：`path.Ext("foo.js/")` 是空串
 			// （最后一个斜杠之后没有点了），`/foo.js/` 会因此落进 SPA 回退、
 			// 拿到 200 + HTML —— 正是这条判据要堵的那类。
-			if staticAssetExts[strings.ToLower(path.Ext(strings.TrimSuffix(p, "/")))] {
+			if staticAssetExts[strings.ToLower(path.Ext(trimmed))] {
 				http.NotFound(w, r)
 				return
 			}
-			r = r.Clone(r.Context())
-			r.URL.Path = "/"
+			file = "index.html"
 		}
-		fileServer.ServeHTTP(w, r)
+		// 用中性 URL 路径去发这个文件：ServeFileFS 会看 r.URL.Path 决定要不要做
+		// "…/index.html → ./" 的重定向，中性路径让这类重定向无从产生。
+		// （clone 而不是改原请求：调用方之后可能还要用 r.URL。）
+		asset := r.Clone(r.Context())
+		asset.URL.Path = "/__static__"
+		http.ServeFileFS(w, asset, s.Assets, file)
 	})
 }

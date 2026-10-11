@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -49,7 +50,7 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
-const version = "1.0.1"
+const version = "1.1.0"
 
 // nowMillis 返回当前毫秒时间戳（跨边界时间戳统一用毫秒）。
 func nowMillis() int64 { return time.Now().UnixMilli() }
@@ -97,6 +98,42 @@ func main() {
 		fatalStartup(*dataDir, "创建数据目录失败: %v", err)
 	}
 
+	// 桌面形态：日志只落文件，**不往控制台打**。
+	//
+	// 用户是在用图形界面，控制台里的日志对他没有意义（双击启动时压根没有控制台）；
+	// 只有 -web 模式需要打印 —— 那时候他就是在终端里工作。
+	//
+	// **位置必须在任何 goroutine 起来之前、也在起服务之前**（复审·低L4）：
+	// 以前这段排在 `go apiSrv.Serve(ln)` 后面，启动最初几条日志（规则库报告、
+	// 残留连接标记、清理记录）的去向取决于调度 —— 有时进文件、有时进虚空，
+	// 出问题时翻日志发现开头是断的。
+	//
+	// 注意 Wails 内部还有若干 log.Fatal / os.Exit（窗口创建失败、WebView2 初始化
+	// 失败等），它们不经过 fatalStartup，双击时又是"闪一下就没了"，
+	// 所以这份日志至少保证事后能查。
+	if !*webMode {
+		if lf, err := os.OpenFile(filepath.Join(*dataDir, "awdshell.log"),
+			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			log.SetOutput(lf)
+			closeLog := onceFn(func() { _ = lf.Close() })
+			defer closeLog()
+			registerCleanup(closeLog)
+		}
+	}
+
+	// **保险库必须在开库之前初始化**，这个顺序是有意的。
+	//
+	// secret.New 要判断"首次运行"还是"key.bin 丢了"（后者要报错而不是安静换钥），
+	// 判据是"数据目录里有没有程序自己的痕迹"。而 store.OpenDetail 会**创建**
+	// awdshell.db —— 先开库再建密钥的话，全新安装的空目录会立刻被自己的新库
+	// 判成"不是首次运行"，于是拒绝生成 key.bin 并退出，程序根本起不来。
+	// 反过来（密钥先、库后）两个语义都对：空目录 → 首次运行 → 建 key.bin；
+	// 老目录丢了 key.bin → 见到上次留下的 awdshell.db → 如实报错。
+	vault, err := secret.New(*dataDir)
+	if err != nil {
+		fatalStartup(*dataDir, "初始化凭据保险库失败: %v", err)
+	}
+
 	// OpenDetail：数据库损坏时会自动留档重建（只改名，不删除），
 	// 并把补救说明返回回来 —— 必须弹框告诉用户，否则他看到的是"数据凭空没了"。
 	st, note, err := store.OpenDetail(filepath.Join(*dataDir, "awdshell.db"))
@@ -107,16 +144,22 @@ func main() {
 		log.Printf("数据库补救：%s", note)
 		userVisibleBox("本地数据库已重建", note, false)
 	}
-	defer st.Close()
-
-	vault, err := secret.New(*dataDir)
-	if err != nil {
-		fatalStartup(*dataDir, "初始化凭据保险库失败: %v", err)
-	}
+	// 每条收尾都进收尾表：正常返回靠 defer，fatalStartup / 启动期 panic
+	// 会直接 os.Exit（不跑 defer），那条路径靠 runCleanups 显式跑一遍。
+	// onceFn 保证两套路径都碰到同一个资源时只关一次。
+	closeStore := onceFn(func() {
+		if err := st.Close(); err != nil {
+			log.Printf("关闭数据库失败: %v", err)
+		}
+	})
+	defer closeStore()
+	registerCleanup(closeStore)
 
 	// 连接池：同一目标只握手一次，终端 / 文件 / 监控共用同一条 SSH 连接的不同 channel。
 	pool := sshx.NewPool(5 * time.Minute)
-	defer pool.CloseAll()
+	closePool := onceFn(pool.CloseAll)
+	defer closePool()
+	registerCleanup(closePool)
 
 	settingsSvc := service.NewSettingsService(st)
 	targets := service.NewTargetService(st, vault)
@@ -128,6 +171,15 @@ func main() {
 	threat := service.NewThreatService(st)
 	// 数据库管理：通过已有 SSH 连接拨号到目标机上的数据库，不直连、不装 agent
 	dbSvc := service.NewDatabaseService(targets, pool, st, vault)
+	// 会话与数据库连接池的收尾也进收尾表：它们会占着共享 SSH 连接（终端、
+	// 数据库隧道），fatalStartup 那条 os.Exit 路径不跑 defer，漏了这里就是
+	// "进程没了但远端还挂着会话"。
+	closeSessions := onceFn(func() {
+		sessions.CloseAll()
+		dbSvc.CloseAll()
+	})
+	defer closeSessions()
+	registerCleanup(closeSessions)
 	// 删目标时把它的数据库连接池一起关掉：只删配置的话，dbx.Conn 还活着、
 	// SSH 隧道开着，`/api/db/query` 仍能对着已删目标走通。
 	targets.SetOnDelete(dbSvc.DropConnsOfTarget)
@@ -135,6 +187,11 @@ func main() {
 	// 拿着几小时前的 CPU 时间片/网卡计数当基准，算出来的百分比是假的。
 	// 注意用 AddOnDelete（追加）而不是 SetOnDelete（覆盖）—— 后者会把上面那个顶掉。
 	targets.AddOnDelete(monitor.Forget)
+	// **更新**已有目标时也要清一次：编辑目标把 host/凭据改成另一台机器时，
+	// Save 会保留原 ID，于是采样基准还是旧那台的 CPU 时间片与网卡计数 ——
+	// 下一次采样的 CPU% 与网速是假的，而且 First=false，界面按真值画出来
+	//（审计 H2：这是"错误数据"而不是"缺失数据"）。
+	targets.AddOnSave(monitor.Forget)
 
 	// 上次若是被强杀或崩溃，会留下"没有结束时间"的记录，启动时先标记为中断。
 	// 规则库加载情况：有规则没生效时留一行摘要，正常时不输出（细节在界面里看）
@@ -195,7 +252,11 @@ func main() {
 
 	// 控制面令牌：随机生成、注入给页面，前端每个请求都带上。
 	// 用它取代"猜桌面 WebView 的 Origin"——猜错就是整个桌面形态被自己挡在门外。
-	// 顺带也让本机其它进程难以直接调用控制面。
+	//
+	// **它是"凭据门"，不是"进程门"**：控制面只监听 127.0.0.1，而本机任何进程
+	// 本来就在信任边界之内（它读得到 key.bin、SQLite 与进程内存，也 GET 得到
+	// 注入令牌的 /runtime.js）。所以令牌挡的是**跨源网页**和**误连**，
+	// 不是"本机其它进程"。别把它写成进程隔离（审计 H1：旧注释写的正是反的）。
 	tokenBytes := make([]byte, 24)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		fatalStartup(*dataDir, "生成控制面令牌失败: %v", err)
@@ -242,28 +303,13 @@ func main() {
 
 	// 数据服务（控制面 + 数据面）
 	apiSrv := &http.Server{Handler: httpapi.New(deps).Handler()}
+	registerCleanup(func() { _ = apiSrv.Close() })
 	go func() {
 		if err := apiSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			// 服务挂了界面会全是 Failed to fetch，不如直接说清楚
 			fatalStartup(*dataDir, "本地数据服务退出: %v", err)
 		}
 	}()
-
-	// 桌面形态：日志只落文件，**不往控制台打**。
-	//
-	// 用户是在用图形界面，控制台里的日志对他没有意义（双击启动时压根没有控制台）；
-	// 只有 -web 模式需要打印 —— 那时候他就是在终端里工作。
-	//
-	// 注意 Wails 内部还有若干 log.Fatal / os.Exit（窗口创建失败、WebView2 初始化
-	// 失败等），它们不经过 fatalStartup，双击时又是"闪一下就没了"，
-	// 所以这份日志至少保证事后能查。
-	if !*webMode {
-		if lf, err := os.OpenFile(filepath.Join(*dataDir, "awdshell.log"),
-			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-			log.SetOutput(lf)
-			defer lf.Close()
-		}
-	}
 
 	err = wails.Run(&options.App{
 		Title:     "awdshell",
@@ -307,9 +353,10 @@ func main() {
 			appCtx.Store(ctx)
 		},
 		OnShutdown: func(ctx context.Context) {
-			sessions.CloseAll()
-			dbSvc.CloseAll()
-			pool.CloseAll()
+			// 收尾动作与 fatalStartup 的收尾表同源（onceFn 保证最多生效一次，
+			// 这里关过的，退出路径上不会再关第二遍）。
+			closeSessions()
+			closePool()
 			_ = apiSrv.Close()
 		},
 	})
@@ -321,6 +368,9 @@ func main() {
 // runWebMode 以浏览器模式运行（无原生窗口）。
 func runWebMode(ln net.Listener, srv *httpapi.Server, apiBase, dataDir string, open bool, sessions *service.SessionService) {
 	httpSrv := &http.Server{Handler: srv.Handler()}
+	// 收尾表里也要有一份：服务自己挂掉时是从下面的 goroutine 走 fatalStartup 的，
+	// 那条路 os.Exit 不跑 defer（复审 M5）。
+	registerCleanup(func() { _ = httpSrv.Close() })
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			// 服务挂了就别让用户对着一个死端口等（浏览器可能已经打开了）
@@ -367,17 +417,75 @@ func usage() {
 // webModeFlag 记录是不是 -web 形态（原子：会被 HTTP goroutine 读）。
 var webModeFlag atomic.Bool
 
-// handleStartupPanic 兜住启动期的 panic：写日志 + 提示 + 恢复控制台代码页，
-// 返回该用的进程退出码。
+// ---------- 启动收尾表 ----------
+//
+// 为什么需要它（复审 M5）：fatalStartup 与启动期 panic 兜底都会**直接 os.Exit**，
+// 而 os.Exit 不跑 defer。实测最要紧的那条路是"桌面形态下 apiSrv.Serve 挂掉"：
+// 它从 goroutine 里调 fatalStartup，于是 st.Close()（关库、合掉 -wal）、
+// pool.CloseAll()（断开 SSH）、sessions.CloseAll()/dbSvc.CloseAll()（收会话与
+// 数据库隧道）、日志文件关闭，一个都不会执行。
+//
+// 语义与 defer 一致：**逆序**执行（后注册的先跑），每个动作最多生效一次。
+
+var (
+	cleanupMu       sync.Mutex
+	startupCleanups []func()
+)
+
+// registerCleanup 把一个收尾动作登记进收尾表（nil 忽略）。
+func registerCleanup(fn func()) {
+	if fn == nil {
+		return
+	}
+	cleanupMu.Lock()
+	startupCleanups = append(startupCleanups, fn)
+	cleanupMu.Unlock()
+}
+
+// runCleanups 逆序执行并清空收尾表（可重复调用，第二次是空跑）。
+//
+// 单个动作自己 panic 不能连累后面的：这条路径上进程正要退出，让一个关不掉的
+// 资源把整个收尾打断，等于其它资源也不收尾了。
+func runCleanups() {
+	cleanupMu.Lock()
+	fns := startupCleanups
+	startupCleanups = nil
+	cleanupMu.Unlock()
+	for i := len(fns) - 1; i >= 0; i-- {
+		func(fn func()) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("收尾 %T 时出错: %v", fn, rec)
+				}
+			}()
+			fn()
+		}(fns[i])
+	}
+}
+
+// onceFn 把收尾动作包成"最多生效一次"：正常返回路径（defer）、Wails 的
+// OnShutdown 与 fatalStartup 的显式收尾，三边都可能碰到同一个资源。
+func onceFn(fn func()) func() {
+	var once sync.Once
+	return func() { once.Do(fn) }
+}
+
+// handleStartupPanic 兜住启动期的 panic：写日志 + 提示 + 恢复控制台代码页 +
+// 显式收尾，返回该用的进程退出码。
 //
 // 单独抽成一个返回值函数，是为了让"退出码不是 0"这条判据有地方钉
 // （main 里就只剩 os.Exit(handleStartupPanic(...)) 这一行）。
+//
+// 这里也要 runCleanups（复审 M5 的同一类）：调用点写的是
+// `os.Exit(handleStartupPanic(...))`，os.Exit 之后剩下的 defer 一个都不会跑，
+// 库与连接池同样收不了尾。
 func handleStartupPanic(dataDir string, rec any, stack []byte) int {
 	msg := fmt.Sprintf("程序内部错误: %v", rec)
 	log.Printf("%s\n%s", msg, stack)
 	_ = writeStartupLog(dataDir, msg)
 	userVisibleBox("awdshell 出错", msg, true)
 	restoreConsoleCP()
+	runCleanups()
 	return 1
 }
 
@@ -399,11 +507,17 @@ func userVisibleBox(title, text string, isError bool) {
 	showNotice(title, text)
 }
 
-// fatalStartup 报告启动阶段的致命错误：写日志 + 弹原生错误框 + 退出。
+// fatalStartup 报告启动阶段的致命错误：写日志 + 弹原生错误框 + **显式收尾** + 以退出码 1 结束。
 //
 // 为什么不能只用 log.Fatalf：exe 是 GUI 子系统，双击运行时没有控制台，
 // 日志写进虚空，用户只看到程序闪一下就没了，根本不知道出了什么事。
 // 所以这里把原因同时落到数据目录里的 startup-error.log 并弹框显示。
+//
+// 为什么不是"返回退出码、由 main 统一收尾"（复审 M5）：这条路径**会从
+// goroutine 里走**（`go apiSrv.Serve(ln)` 失败 → "本地数据服务退出"），
+// 还从 defer recover 里走，没有一条能回到 main 的顺序执行流上；能做的只有
+// "退出前显式把收尾表跑一遍"。所以收尾放在这里，退出码与提示保持原样：
+// 仍是 1、-web 下写 stderr、桌面形态下弹框。
 func fatalStartup(dataDir, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("启动失败: %s", msg)
@@ -414,6 +528,12 @@ func fatalStartup(dataDir, format string, args ...any) {
 	}
 	userVisibleBox("awdshell 启动失败", msg+detail, true)
 	restoreConsoleCP()
+	// 顺序是有意的：**先让用户看到原因，再动资源**。
+	//   - 反过来的话，日志文件已经被收尾关掉，紧接着那句"启动失败：…"
+	//     就没地方写了（桌面形态日志只落文件）；
+	//   - 弹框是阻塞的：万一收尾里有个动作卡住（关 SSH 会话），先弹框至少
+	//     保证用户知道出了什么事，而不是一个没有任何提示的僵住进程。
+	runCleanups()
 	os.Exit(1)
 }
 

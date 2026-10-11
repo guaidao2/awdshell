@@ -50,7 +50,15 @@ func (s *Server) handleCompliance(w http.ResponseWriter, r *http.Request) {
 		}
 		// 走带体积上限的解析：裸 Decode 会把这个 body 整个吃进内存（实测 9MB）
 		if err := decode(r, &body); err != nil {
-			writeErr(w, http.StatusBadRequest, errText("请求体解析失败"))
+			// **把 decodeLimit 的具体原因带上**：它已经能区分"超过 8MB"与
+			// "不是合法 JSON"，以前一句"请求体解析失败"把两者抹平了 ——
+			// 用户不知道该去改内容大小还是改格式。
+			if errors.Is(err, io.EOF) {
+				// 这个接口的 body 是必需的（要有 target_id），空 body 说清是空的
+				writeErr(w, http.StatusBadRequest, errText("请求体是空的（缺少 target_id）"))
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
 		if strings.TrimSpace(body.TargetID) == "" {

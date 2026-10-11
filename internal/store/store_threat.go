@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"time"
 )
 
@@ -138,24 +139,28 @@ func (s *Store) ThreatStats(since int64, targetID string) (ThreatStats, error) {
 		return stats, nil
 	}
 
-	// 来源 IP：次数、首末时间、涉及目标数、其中 critical 条数
-	rows, err := s.db.Query(`SELECT source_ip, COUNT(*) AS c,
+	// 来源 IP：次数、首末时间、涉及目标数、其中 critical 条数。
+	//
+	// 每个循环都走 collectRows：它保证 Close 之后**必查 rows.Err()**。
+	// 以前五个循环都是"迭代完就 Close"，迭代中途出错（驱动报错、查询被中断）
+	// 会被当成"结果就这么多"，态势页静默少数据。
+	if err := collectRows(func() (*sql.Rows, error) {
+		return s.db.Query(`SELECT source_ip, COUNT(*) AS c,
 		MIN(ts), MAX(ts), COUNT(DISTINCT target_id),
 		SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END)
 		FROM scan_events WHERE `+where+` AND source_ip <> ''
 		GROUP BY source_ip ORDER BY c DESC LIMIT 30`, args...)
-	if err != nil {
+	},
+		func(rows *sql.Rows) error {
+			var a AddrCount
+			if err := rows.Scan(&a.IP, &a.Count, &a.FirstSeen, &a.LastSeen, &a.Targets, &a.Critical); err != nil {
+				return err
+			}
+			stats.BySourceIP = append(stats.BySourceIP, a)
+			return nil
+		}); err != nil {
 		return stats, err
 	}
-	for rows.Next() {
-		var a AddrCount
-		if err := rows.Scan(&a.IP, &a.Count, &a.FirstSeen, &a.LastSeen, &a.Targets, &a.Critical); err != nil {
-			rows.Close()
-			return stats, err
-		}
-		stats.BySourceIP = append(stats.BySourceIP, a)
-	}
-	rows.Close()
 
 	simple := []struct {
 		col  string
@@ -167,75 +172,99 @@ func (s *Store) ThreatStats(since int64, targetID string) (ThreatStats, error) {
 		{"rule_id", &stats.ByRule, 20},
 	}
 	for _, item := range simple {
-		rs, err := s.db.Query(`SELECT `+item.col+`, COUNT(*) AS c FROM scan_events WHERE `+where+`
+		if err := collectRows(func() (*sql.Rows, error) {
+			return s.db.Query(`SELECT `+item.col+`, COUNT(*) AS c FROM scan_events WHERE `+where+`
 			GROUP BY `+item.col+` ORDER BY c DESC LIMIT ?`, append(args, item.lim)...)
-		if err != nil {
+		},
+			func(rows *sql.Rows) error {
+				var n NameCount
+				if err := rows.Scan(&n.Name, &n.Count); err != nil {
+					return err
+				}
+				*item.dest = append(*item.dest, n)
+				return nil
+			}); err != nil {
 			return stats, err
 		}
-		for rs.Next() {
-			var n NameCount
-			if err := rs.Scan(&n.Name, &n.Count); err != nil {
-				rs.Close()
-				return stats, err
-			}
-			*item.dest = append(*item.dest, n)
-		}
-		rs.Close()
 	}
 
 	// 目标分布：哪台机器被打得最多
-	rs, err := s.db.Query(`SELECT target_name, COUNT(*) AS c FROM scan_events WHERE `+where+`
+	if err := collectRows(func() (*sql.Rows, error) {
+		return s.db.Query(`SELECT target_name, COUNT(*) AS c FROM scan_events WHERE `+where+`
 		GROUP BY target_name ORDER BY c DESC LIMIT 20`, args...)
-	if err != nil {
+	},
+		func(rows *sql.Rows) error {
+			var n NameCount
+			if err := rows.Scan(&n.Name, &n.Count); err != nil {
+				return err
+			}
+			stats.ByTarget = append(stats.ByTarget, n)
+			return nil
+		}); err != nil {
 		return stats, err
 	}
-	for rs.Next() {
-		var n NameCount
-		if err := rs.Scan(&n.Name, &n.Count); err != nil {
-			rs.Close()
-			return stats, err
-		}
-		stats.ByTarget = append(stats.ByTarget, n)
-	}
-	rs.Close()
 
 	// 时间线：按天分桶。ts 存的是毫秒，先除回秒再交给 sqlite 的日期函数
-	tl, err := s.db.Query(`SELECT date(ts / 1000, 'unixepoch', 'localtime') AS d, COUNT(*) AS c
+	if err := collectRows(func() (*sql.Rows, error) {
+		return s.db.Query(`SELECT date(ts / 1000, 'unixepoch', 'localtime') AS d, COUNT(*) AS c
 		FROM scan_events WHERE `+where+` GROUP BY d ORDER BY d`, args...)
-	if err != nil {
+	},
+		func(rows *sql.Rows) error {
+			var b TimeBucket
+			if err := rows.Scan(&b.Bucket, &b.Count); err != nil {
+				return err
+			}
+			stats.Timeline = append(stats.Timeline, b)
+			return nil
+		}); err != nil {
 		return stats, err
 	}
-	for tl.Next() {
-		var b TimeBucket
-		if err := tl.Scan(&b.Bucket, &b.Count); err != nil {
-			tl.Close()
-			return stats, err
-		}
-		stats.Timeline = append(stats.Timeline, b)
-	}
-	tl.Close()
 
 	// 最近事件
-	rec, err := s.db.Query(`SELECT ts, target_id, target_name, path, kind, rule_id, rule_name,
+	if err := collectRows(func() (*sql.Rows, error) {
+		return s.db.Query(`SELECT ts, target_id, target_name, path, kind, rule_id, rule_name,
 		severity, category, source_ip, line_no, decoded, sample
 		FROM scan_events WHERE `+where+` ORDER BY ts DESC, id DESC LIMIT 60`, args...)
-	if err != nil {
+	},
+		func(rows *sql.Rows) error {
+			var e ScanEvent
+			var decoded int
+			if err := rows.Scan(&e.TS, &e.TargetID, &e.TargetName, &e.Path, &e.Kind, &e.RuleID,
+				&e.RuleName, &e.Severity, &e.Category, &e.SourceIP, &e.LineNo, &decoded, &e.Sample); err != nil {
+				return err
+			}
+			e.Decoded = decoded == 1
+			stats.Recent = append(stats.Recent, e)
+			return nil
+		}); err != nil {
 		return stats, err
 	}
-	for rec.Next() {
-		var e ScanEvent
-		var decoded int
-		if err := rec.Scan(&e.TS, &e.TargetID, &e.TargetName, &e.Path, &e.Kind, &e.RuleID,
-			&e.RuleName, &e.Severity, &e.Category, &e.SourceIP, &e.LineNo, &decoded, &e.Sample); err != nil {
-			rec.Close()
-			return stats, err
-		}
-		e.Decoded = decoded == 1
-		stats.Recent = append(stats.Recent, e)
-	}
-	rec.Close()
 
 	return stats, nil
+}
+
+// collectRows 收一个 query 闭包与一个逐行 scan 回调，保证**无论怎么退出都 Close，
+// 并且 Close 之后必查 rows.Err()**。
+//
+// 为什么要这样：迭代中途出错时 rows.Next() 只是返回 false，错误挂在 rows.Err()
+// 上。老写法（迭代完直接 Close）会把"查询中途失败"当成"结果就这么多"，
+// 态势页静默少数据 —— 用户看到的是一个不报错的错结论。
+//
+// 收闭包而不是收 (*sql.Rows, error)：Go 不允许把多值调用和别的实参混在同一个
+// 调用里（`f(g())` 只能独占实参表），传闭包既绕开这条限制，也让"查询失败"与
+// "迭代失败"在同一个地方被处理。
+func collectRows(query func() (*sql.Rows, error), scan func(*sql.Rows) error) error {
+	rows, err := query()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 // PruneScanEvents 删除 before 之前的事件，返回删除条数。

@@ -26,13 +26,20 @@ checks:
     category: 身份鉴别
     severity: critical
     refs: ["等保 8.1.4.1 身份鉴别", "CIS 6.2.1"]
-    command: "awk -F: '($2==\"\"){print $1}' /etc/shadow 2>/dev/null"
+    # 命令自己报可读性（复审 中2）：非 root 读 /etc/shadow（0640 root:shadow）
+    # 会 EACCES，`awk` 什么都不输出、退出码非 0 —— 而"读不到"与"确实没有空口令
+    # 账号"在输出上完全一样。以前的写法没有 `|| true`，无输出时退出码非 0，
+    # sshx.RunOutput 返回 ExitError，判定端在 err != nil 处就返回 error，
+    # **干净 + root 的主机上这一条也从来没 pass 过**。
+    # 现在：读到了打 __AWD_READ_OK__（空结果可信），读不到打 __AWD_READ_DENIED__
+    #（判定端据此标 error「需要 root」，绝不判合规）。
+    command: "if [ -r /etc/shadow ]; then awk -F: '($2==\"\"){print $1}' /etc/shadow 2>/dev/null || true; echo __AWD_READ_OK__; else echo __AWD_READ_DENIED__; fi"
     expect:
       type: regex_not_match
       pattern: '\S'
     remedy: "为空口令账号设置强口令，或锁定不需要登录的账号（passwd -l 账号）。"
     needs_root: true
-    note: "需要 root 权限读取 /etc/shadow，普通账号执行会得到空结果（会显示为通过，请以 root 运行）。"
+    note: "需要 root 权限读取 /etc/shadow；普通账号执行会在结果里标成「需要 root」，不会显示成「符合」。"
 
   - id: CHK-ID-003
     title: "口令最长有效期不超过 90 天"

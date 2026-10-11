@@ -58,9 +58,56 @@ func RunOutput(client *ssh.Client, command string, timeout time.Duration) (strin
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	sess, err := client.NewSession()
-	if err != nil {
+	// **NewSession 本身也要设超时**：它要开一条 channel 并等对端确认，而连接假死
+	//（socket 还开着、对端不回包 —— 正是 Alive 存在的理由）时它会一直等。
+	// 审计实测：服务端握手成功但永不接受 channel 时，带 800ms 超时的 RunOutput
+	// 4 秒都不返回，于是 monitor 15s / logscan 25s / compliance 每项 10s 的超时
+	// 全部形同虚设，goroutine 与 session 一起漏。
+	sessCh := make(chan *ssh.Session, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		s, err := client.NewSession()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		sessCh <- s
+	}()
+	var sess *ssh.Session
+	select {
+	case sess = <-sessCh:
+	case err := <-errCh:
 		return "", fmt.Errorf("创建执行通道失败: %w", err)
+	case <-time.After(timeout):
+		// 超时返回前**必须把这条迟到的 session 收掉**（复审 中3）。
+		//
+		// 为什么：NewSession 在另一个 goroutine 里，它的结果只能落在 sessCh 上。
+		// 超时分支以前直接 return，`defer sess.Close()` 还没注册 —— 于是
+		// "开通道超时"每发生一次，就在 sshd 那边漏掉一条 session。而
+		// sshd 的 MaxSessions 默认只有 10：漏满 10 条之后**所有**新会话都会
+		// 被拒（`ssh: rejected: administratively prohibited`），而 IsConnError
+		// 故意不把 OpenChannelError 当连接错误（重连也解决不了），于是
+		// 界面表现为"什么都用不了，但连接是活的"，不会自动恢复。
+		//
+		// 处理分两步：
+		//   1) 已经躺在缓冲里（1 容量）的就地关掉；
+		//   2) 还没到的交给一个收尾 goroutine 等它到，到了立刻关。
+		//      等一个有限的窗口：对端彻底假死时 NewSession 不会返回，
+		//      无限等会变成"每超时一次漏一个 goroutine"（同样是漏，
+		//      只是漏在本地）。窗口取 30s，远大于正常对端确认耗时。
+		select {
+		case s := <-sessCh:
+			_ = s.Close()
+		default:
+			go func() {
+				select {
+				case s := <-sessCh:
+					_ = s.Close()
+				case <-time.After(30 * time.Second):
+				}
+			}()
+		}
+		return "", fmt.Errorf("%w（开执行通道超时 %s）", ErrRunTimeout, timeout)
 	}
 	defer sess.Close()
 

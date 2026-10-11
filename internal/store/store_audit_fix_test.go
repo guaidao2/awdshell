@@ -217,23 +217,35 @@ func TestDeleteDBConnsOfTargetOnlyTouchesThatTarget(t *testing.T) {
 // ---------- 低8：只标"本次打开之前开始的"会话 ----------
 
 // 启动时标中断不能碰"本次打开之后才开始"的会话（两个实例共用数据目录的场景）。
+//
+// 崩溃残留用**另一个 pid** 来造：判据是"写下这条记录的进程还在不在"（owner_pid
+// + 进程存活检查），不是单纯的 started_at。同一个 pid 写的记录一律不标 ——
+// 那是本进程正在跑的会话。
 func TestMarkStaleConnectionsOnlyMarksOlderOnes(t *testing.T) {
 	st := newTestStore(t)
 
-	// 崩溃残留：本次启动之前就开始了，ended_at 还是 0
+	// 崩溃残留：上一次运行（另一个 pid）留下的、没有结束时间的记录
 	oldID, err := st.AddConnection(domain.ConnectionRecord{
 		Host: "old", Port: 22, Username: "root", StartedAt: time.Now().UnixMilli() - 60_000,
 	})
 	if err != nil {
 		t.Fatalf("插入旧记录失败: %v", err)
 	}
-	// 正在跑的会话：本次打开之后才开始（模拟另一个实例刚建的连接）
+	if _, err := st.db.Exec(`UPDATE connections SET owner_pid = 991999 WHERE id = ?`, oldID); err != nil {
+		t.Fatalf("改成别的进程写的失败: %v", err)
+	}
+	// 正在跑的会话：本进程刚建的连接（owner_pid = 本进程）
 	liveID, err := st.AddConnection(domain.ConnectionRecord{
 		Host: "live", Port: 22, Username: "root", StartedAt: time.Now().UnixMilli(),
 	})
 	if err != nil {
 		t.Fatalf("插入新记录失败: %v", err)
 	}
+
+	// 那个 pid 早已不存在
+	origAlive := ownerAlive
+	ownerAlive = func(pid int) bool { return pid == os.Getpid() }
+	defer func() { ownerAlive = origAlive }()
 
 	n, err := st.MarkStaleConnections("程序未正常退出")
 	if err != nil {

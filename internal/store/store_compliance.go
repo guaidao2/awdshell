@@ -81,6 +81,9 @@ func (s *Store) SaveComplianceReport(r ComplianceReport) (int64, error) {
 	if r.TS == 0 {
 		r.TS = time.Now().UnixMilli()
 	}
+	// 调用方给的秒级/坏值 TS 必须在这里收拾掉：PruneComplianceReports 拿的是
+	// 原始 ts 与毫秒 before 比大小，秒级行会被当成 1970 年的数据直接删掉。
+	r.TS = normalizeOrNow(r.TS)
 	res, err := s.db.Exec(`INSERT INTO compliance_reports
 		(ts, target_id, target, score, total, pass, fail, manual, err_count, elapsed_ms, results)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -136,9 +139,50 @@ func (s *Store) ListComplianceReports(targetID string, limit int) ([]ComplianceR
 // 毫秒化是在 v0.1.0 之后才统一的，升级上来的库里可能还留着秒级记录：
 // 不归一的话，它们会被保留期清理当成过期数据直接删掉，
 // 或者在前端被当作毫秒显示成 1970 年。
+//
+// **判据与 SQL 迁移（complianceTSMigration / hostKeyTSMigration）用同一个区间**，
+// 不再用 `ts < 1e11` 这种量级阈值：量级阈值是"猜"（1e11 毫秒 = 1973-03-03，
+// 再往前的毫秒值会被当成秒再乘 1000），固定区间是"说清楚"——
+// 本项目 2026 年才有数据，秒值必然落在 [2000-01-01, 2100-01-01) 里，
+// 毫秒值（>= 1e12）天然在外面。两处判据一致，读侧与写侧才不会各说各话。
 func normalizeTS(ts int64) int64 {
-	if ts > 0 && ts < 1e11 {
+	if isSecondValue(ts) {
 		return ts * 1000
+	}
+	return ts
+}
+
+// 与 complianceTSMigration 里的区间接上：946684800 = 2000-01-01 的秒值，
+// 4102444800 = 2100-01-01 的秒值。
+const (
+	secondValueLower = 946684800
+	secondValueUpper = 4102444800
+)
+
+// isSecondValue 判断一个时间戳是不是"秒级"（而不是毫秒级）。
+func isSecondValue(ts int64) bool {
+	return ts >= secondValueLower && ts < secondValueUpper
+}
+
+// normalizeOrNow 把调用方给的时间戳收拾成一个合法的毫秒值。
+//
+// 为什么要校验：`SaveComplianceReport` 接受调用方传进来的 TS，而
+// `PruneComplianceReports(before_ms)` 是拿原始 ts 在 SQL 里比大小的 ——
+// 秒级的行会被当成 1970 年的过期数据**直接删掉**（要等下次打开库才被迁移救回）。
+// 三种情况分开处理：
+//   - 0：调用方没给 → 用现在（原有行为）；
+//   - 落在秒值区间：明确是秒 → 换算成毫秒再落库；
+//   - 其它（负数、1980 年前的毫秒值之类）：当"坏值"用现在替换，
+//     而不是让它进库变成一条永远排在最后、还会被清理当垃圾删掉的记录。
+func normalizeOrNow(ts int64) int64 {
+	if ts == 0 {
+		return time.Now().UnixMilli()
+	}
+	if isSecondValue(ts) {
+		return ts * 1000
+	}
+	if ts < secondValueLower {
+		return time.Now().UnixMilli()
 	}
 	return ts
 }

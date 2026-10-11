@@ -88,12 +88,21 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 缺 target_id 是**客户端请求不完整**（400），不是服务端故障。
+	// 以前只有 list 判了空，home/startdir/cwd 漏判：这三个接口漏传参数时
+	// targets.Auth("") 失败，被一律写成 502 —— 同类接口（monitor/logs/hostkeys）
+	// 都回 400，口径不一致，前端还会把它当服务端故障提示（审计 M2）。
+	// 判据统一放在这里：只读 action 的 target_id 一律取自 query。
 	switch action {
-	case "list":
+	case "list", "home", "startdir", "cwd", "read", "download":
 		if targetID == "" {
 			writeErr(w, http.StatusBadRequest, errText("缺少 target_id"))
 			return
 		}
+	}
+
+	switch action {
+	case "list":
 		list, err := s.Files.List(targetID, q.Get("path"))
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err)
@@ -212,10 +221,24 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		if in.Trash != nil {
 			trash = *in.Trash
 		}
+		// 空 paths 是"请求没带参数"（400），不是网关故障。
+		// 以前它由 service 层以普通 error 抛出，被下面一律写成 502 ——
+		// 实测 POST /api/files/delete {} 得到 502 Bad Gateway，
+		// 而接口本身的语义是"请求不完整"（审计 M3）。
+		if len(in.Paths) == 0 {
+			writeErr(w, http.StatusBadRequest, errText("没有指定要删除的路径"))
+			return
+		}
 		// 逐条报告结果：部分成功时也要如实告诉调用方哪些删了、哪些没删
 		res, err := s.Files.Delete(in.TargetID, in.Paths, trash)
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err)
+			// 连接/回收站这类失败仍是 502；入参类失败在 service 层用
+			// service.ErrDeleteNoPaths 标出来，如实回 400，别再报成网关故障。
+			status := http.StatusBadGateway
+			if errors.Is(err, service.ErrDeleteNoPaths) {
+				status = http.StatusBadRequest
+			}
+			writeErr(w, status, err)
 			return
 		}
 		// **有失败项就不能回 200**：唯一调用方只 `await req(...)`、不看 body，

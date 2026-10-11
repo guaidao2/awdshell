@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -12,6 +13,20 @@ import (
 	"github.com/guaidao2/awdshell/internal/store"
 
 	"golang.org/x/crypto/ssh"
+)
+
+// 单次扫描的预算与上限。
+//
+// 以前整次扫描没有任何时间预算：实测 2000 行 × 7.2KB 的**正常内容**要 53 秒，
+// 这段时间里界面只有一个核在转、HTTP 请求不返回，用户既看不到进度也取消不掉。
+const (
+	// scanBudget 是规则匹配那一段的时间预算（取日志那一段另有自己的超时）。
+	// 预算耗尽时扫描停在超时处，并在 Result 里如实标记 Truncated / StoppedAtLine，
+	// 结果照常返回 —— 半份结果加一句"不完整"远比"什么都不回"有用。
+	scanBudget = 20 * time.Second
+	// scanMaxHits 与 logscan.DefaultMaxHits 同值（那边是引擎侧的兜底），
+	// 这里显式引一次是为了让 service 的取舍有名字可指，不写字面量。
+	scanMaxHits = logscan.DefaultMaxHits
 )
 
 // LogFile 是目标主机上一个可扫描的日志。
@@ -26,6 +41,14 @@ type LogScanService struct {
 	targets *TargetService
 	pool    *sshx.Pool
 	store   *store.Store
+
+	// readLog 是"把日志尾部若干行取回来"的可替换钩子，nil 表示走 sshx
+	//（见 read）。存在的唯一理由是测试：不替身这一环，就没法在不起 SSH 的
+	// 情况下测到"整次扫描的时间预算"—— ScanLog 的前半段必须先拿到文本。
+	readLog func(script string, timeout time.Duration) (string, error)
+	// scanBudgetForTest 只在测试里设置（默认 0 = 用 scanBudget）：
+	// 真跑 20 秒才能验到"到点就停"的话，这条用例没人愿意跑。
+	scanBudgetForTest time.Duration
 }
 
 // NewLogScanService 构造服务。
@@ -74,15 +97,24 @@ func classifyLog(p string) string {
 }
 
 // ScanLog 扫描某个日志文件的尾部若干行。
-func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) (logscan.Result, error) {
+//
+// ctx 是发起这次扫描的请求的 context：整次扫描有 scanBudget 的时间预算，
+// 用户关页面/切走时应当提前收手，而不是把整批日志跑完再把结果丢掉。
+// 预算或取消导致的提前收工**不会丢结果**：Result.Truncated 为 true、
+// TruncatedReason 说明原因、StoppedAtLine 说明停在哪一行，照常返回给前端。
+func (s *LogScanService) ScanLog(ctx context.Context, targetID, path string, lines int, kind string) (logscan.Result, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return logscan.Result{}, fmt.Errorf("请选择要扫描的日志文件")
 	}
-	// 取一下目标名，落库时要记清是哪台机器
+	// 取一下目标名，落库时要记清是哪台机器。
+	// targets 为 nil（测试构造）时跳过：这里只是给落库记录补一个好看的名字，
+	// 不该成为"没有目标服务就没法扫描"的理由。
 	targetName := targetID
-	if tg, _, err := s.targets.Auth(targetID); err == nil {
-		targetName = tg.Name
+	if s.targets != nil {
+		if tg, _, err := s.targets.Auth(targetID); err == nil {
+			targetName = tg.Name
+		}
 	}
 	// 路径只允许常规字符，避免拼接进 shell 造成注入
 	if strings.ContainsAny(path, ";&|`$()<>\"'\n\t ") {
@@ -106,7 +138,7 @@ func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) 
 		cmd = fmt.Sprintf("tail -n %d %s 2>/dev/null", lines, shellQuotePath(path))
 	}
 
-	out, err := s.run(targetID, cmd, 25*time.Second)
+	out, err := s.read(targetID, cmd, 25*time.Second)
 	if err != nil {
 		// 读不到文件时退出码非 0，换成能看懂的提示
 		if utmpTool != "" {
@@ -133,7 +165,12 @@ func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) 
 	//（GuessLogKind），两次推断不一致时就会在 web 行上跑认证关联 ——
 	// 混合日志（前 300 行 syslog 不少于 web 行）正好会撞上。
 	// ScanWithKind 会把实际用的 Kind/KindAuto 回填进 Result。
-	res := logscan.ScanWithKind(out, path, rules, kind)
+	//
+	// 走 runScan 而不是直接调 ScanWithKind：那里给了时间预算与 ctx，
+	// 整次扫描不会再无上限地跑（见 scanBudget 的说明）。
+	// 走 runScan 而不是直接调 ScanWithKind：那里给了时间预算与 ctx，
+	// 整次扫描不会再无上限地跑（见 scanBudget 的说明）。
+	res := runScan(ctx, out, path, rules, kind, s.budget())
 	// RuleCount 要保留：RulesForKind 过后 rules 才是本次真正用的规则集，
 	// ScanWithKind 里设的是 AllRules 的长度。
 	res.RuleCount = len(rules)
@@ -180,6 +217,44 @@ func (s *LogScanService) ScanLog(targetID, path string, lines int, kind string) 
 
 func shellQuotePath(p string) string {
 	return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'"
+}
+
+// runScan 是"把日志文本交给规则引擎"的唯一入口，预算与取消都在这里给。
+//
+// 为什么单独抽一层：ScanLog 要先把日志从目标机取回来（那一步单测做不到），
+// 而"有没有给时间预算/会不会响应取消"这件事必须能被直接测到 —— 抽出来之后
+// 测试可以自己造文本、ctx 与预算，改回无预算的 ScanWithKind 时立刻红。
+//
+// budget 由调用方给（生产路径传 scanBudget）：做成参数而不是直接读常量，
+// 是为了让测试能用一个极小的预算验证"到点就停"，不必真跑 20 秒。
+func runScan(ctx context.Context, text, path string, rules []logscan.Rule, kind string, budget time.Duration) logscan.Result {
+	if ctx == nil {
+		// 拿不到请求 context 时（内部调用、测试）用 Background，
+		// 别让 nil 变成"取消不了"之外的另一种行为。
+		ctx = context.Background()
+	}
+	return logscan.ScanWithLimits(text, path, rules, kind, logscan.ScanLimits{
+		MaxDuration: budget,
+		Ctx:         ctx,
+		MaxHits:     scanMaxHits,
+	})
+}
+
+// read 把日志文本取回来：测试可以用 readLog 替身顶上（见字段说明），
+// 生产路径走 run（sshx）。
+func (s *LogScanService) read(targetID, script string, timeout time.Duration) (string, error) {
+	if s.readLog != nil {
+		return s.readLog(script, timeout)
+	}
+	return s.run(targetID, script, timeout)
+}
+
+// budget 是本次扫描的时间预算（测试可覆盖，见 scanBudgetForTest）。
+func (s *LogScanService) budget() time.Duration {
+	if s.scanBudgetForTest > 0 {
+		return s.scanBudgetForTest
+	}
+	return scanBudget
 }
 
 func (s *LogScanService) run(targetID, script string, timeout time.Duration) (string, error) {

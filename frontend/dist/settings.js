@@ -14,7 +14,10 @@
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
       try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 忽略 */ }
-      throw new Error(msg);
+      // 各视图各有一份 req，统一把状态码挂在错误上，调用方才好按语义分支。
+      var sErr = new Error(msg);
+      sErr.status = res.status;
+      throw sErr;
     }
     return res.json();
   }
@@ -151,12 +154,25 @@
       // 回写运行时设置：删除是否走回收站、终端目录是否跟随，读的都是
       // window.AWD_SETTINGS。不回写的话用户改完要重启程序才生效，设置项等于摆设。
       window.AWD_SETTINGS = out;
-      // 回填经后端夹取后的实际值
+      // 回填**全部**字段的实际生效值（不只是数字项）。
+      // 后端改成"逐项写、部分失败也回 200 + 实际生效值 + failed[]"之后，只回填
+      // 数字项会留下一个坑：开关类和路径类还显示用户刚提交的值，而库里其实没写进去
+      // —— 下次保存就把"已经生效的其它项"又盖回去了。
       $('st-days').value = out.conn_keep_days;
       $('st-max').value = out.conn_keep_max;
       $('st-font').value = out.term_font_size;
       $('st-scroll').value = out.term_scrollback;
-      msg('已保存（' + new Date().toLocaleTimeString() + '）');
+      $('st-trash').checked = !!out.trash_on_delete;
+      $('st-cwd').checked = out.term_track_cwd !== false;
+      $('st-event-days').value = out.event_keep_days;
+      $('st-download-dir').value = out.download_dir || '';
+      // failed[] 非空 = 这几项没保存成功（其余已生效），必须说出来
+      var failed = (out && out.failed) || [];
+      if (failed.length) {
+        msg('部分设置未保存：' + failed.join('、') + '（其余已生效）', true);
+      } else {
+        msg('已保存（' + new Date().toLocaleTimeString() + '）');
+      }
     } catch (e) {
       msg('保存失败：' + e.message, true);
     } finally {

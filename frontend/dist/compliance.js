@@ -40,7 +40,10 @@
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
       try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 忽略 */ }
-      throw new Error(msg);
+      // 各视图各有一份 req，统一把状态码挂在错误上，调用方才好按语义分支。
+      var cErr = new Error(msg);
+      cErr.status = res.status;
+      throw cErr;
     }
     return res.json();
   }

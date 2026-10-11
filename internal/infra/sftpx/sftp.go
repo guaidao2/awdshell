@@ -18,13 +18,37 @@ type Client struct {
 	sc *sftp.Client
 }
 
+// sftpOpenTimeout 是开 SFTP 通道的上限。
+//
+// sftp.NewClient 内部要发 subsystem 请求并等对端回 SSH_FXP_VERSION，而这一步
+// 没有 deadline —— 对端回了 subsystem 却不发 VERSION 时它会一直等下去
+// （审计实测：4 秒都不返回），于是文件面板的每个操作都挂住，而外层那些
+// "12 秒超时"全都不管这一段。
+const sftpOpenTimeout = 12 * time.Second
+
 // New 在已有 SSH 连接上开一条 SFTP 通道。
 func New(conn *ssh.Client) (*Client, error) {
-	sc, err := sftp.NewClient(conn)
-	if err != nil {
-		return nil, fmt.Errorf("打开 SFTP 通道失败: %w", err)
+	type result struct {
+		sc  *sftp.Client
+		err error
 	}
-	return &Client{sc: sc}, nil
+	ch := make(chan result, 1)
+	go func() {
+		sc, err := sftp.NewClient(conn)
+		ch <- result{sc, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("打开 SFTP 通道失败: %w", r.err)
+		}
+		return &Client{sc: r.sc}, nil
+	case <-time.After(sftpOpenTimeout):
+		// 注意：那个 goroutine 可能还卡在 recvVersion 上；等对端把连接关掉
+		//（或它自己超时）才会退出。这里不能再关 conn —— 它是终端/监控共用的
+		// 那条，关掉就是掐断用户正在用的终端。
+		return nil, fmt.Errorf("打开 SFTP 通道超时（%s）—— 目标机的 sshd 可能没开 sftp 子系统，或链路假死", sftpOpenTimeout)
+	}
 }
 
 // Close 关闭通道（不关闭底层 SSH 连接）。
@@ -47,10 +71,15 @@ type Entry struct {
 func (c *Client) Raw() *sftp.Client { return c.sc }
 
 // Home 返回登录后的默认目录（通常即家目录）。
+//
+// 不吞错误：以前 `Getwd` 失败时返回 "/" 且 err 为 nil，调用方以为拿到了家目录 ——
+// 回收站会建到根目录、下载默认目录也跟着错。包内其它方法一律 %w 上抛，
+// 这里是唯一的例外。调用方（service/file.go）已经在 `err != nil || home == "/"`
+// 时拒绝操作，所以改成上抛不会破坏那条保护，只是让它更早生效。
 func (c *Client) Home() (string, error) {
 	wd, err := c.sc.Getwd()
 	if err != nil {
-		return "/", nil
+		return "", fmt.Errorf("获取远程家目录失败: %w", err)
 	}
 	return wd, nil
 }

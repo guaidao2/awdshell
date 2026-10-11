@@ -558,8 +558,20 @@ func detectXSS(s string) string {
 	if strings.Contains(low, "expression(") && strings.Contains(low, "(") {
 		return "css expression"
 	}
-	if tagStart := strings.IndexByte(low, '<'); tagStart >= 0 {
-		if handler := eventHandlerNear(low, tagStart); handler != "" {
+	// 每一个 '<' 都要试，不能只看第一个。
+	//
+	// 审计实测 `a < b and <img src=x onerror=alert(1)>` 返回空：第一个 '<' 后面
+	// 跟着空格（不是标签），于是后面的真标签与事件属性再也不会被看到 ——
+	// 而"文本里先出现一个比较号、后面才是标签"在留言、搜索词、User-Agent 里
+	// 太常见了，攻击者只要在前面垫一个 `<`（甚至一个 `a < b`）就能整体绕过。
+	//
+	// 成本可控：eventHandlerNear 在 '<' 后不是字母时 O(1) 返回，
+	// 是字母时也只扫标签内 ≤128 字节。
+	for i := 0; i < len(low); i++ {
+		if low[i] != '<' {
+			continue
+		}
+		if handler := eventHandlerNear(low, i); handler != "" {
 			return "event handler " + handler
 		}
 	}
@@ -827,23 +839,67 @@ func containsShellChars(s string) string {
 	// 光看 `$(` 会把 jQuery 的 `$(document).ready(function(){...})`、
 	// 模板里的 `total price is $(price) * 2` 全打成命令注入，
 	// 而这条规则是 5 分独立拦的。
-	if i := strings.Index(low, "$("); i >= 0 {
-		if j := strings.IndexByte(low[i+2:], ')'); j > 0 {
-			if containsShellCommand(low[i+2 : i+2+j]) {
-				return "command substitution $()"
-			}
+	//
+	// **每一处 $() 都要试**：只看第一处时，`total price is $(price) and then $(id)`
+	// 里第一处是模板变量、真命令在后面，整条漏检（审计实测）。
+	//
+	// 每次只看 `$(` 之后最多 32 字节：命令名就在最前面（containsShellCommand 只比
+	// 开头那一段），截断既够用又避免"每处都扫到行尾"退化成 O(n²)。
+	// 但**不能因为窗口里没有 `)` 就放弃**：`$(cat /etc/passwd /etc/shadow ...)`
+	// 这种长命令体的闭合括号远在 32 字节之外，只看窗口内有没有 `)` 会把它整条漏掉。
+	// 判据：窗口填满（说明后面还有内容）→ 拿窗口当内容判；窗口没填满且没有 `)`
+	// → 这是没闭合的 `$(`，维持旧行为（不算命中）。
+	const substProbe = 32
+	for i := 0; ; {
+		k := strings.Index(low[i:], "$(")
+		if k < 0 {
+			break
 		}
+		i += k
+		seg := low[i+2:]
+		full := len(seg) > substProbe
+		if full {
+			seg = seg[:substProbe]
+		}
+		if j := strings.IndexByte(seg, ')'); j >= 0 {
+			seg = seg[:j]
+		} else if !full {
+			i += 2
+			continue
+		}
+		if containsShellCommand(seg) {
+			return "command substitution $()"
+		}
+		i += 2
 	}
 	// 反引号：要求里面也是命令形态。
 	// `Set the ` + "`PATH`" + ` variable in your shell profile` 这种写法在日志里很常见，
 	// 而 ` + "`id`" + `、` + "`cat /etc/passwd`" + ` 才是命令替换。
-	if strings.Count(low, "`") >= 2 {
-		if i := strings.IndexByte(low, '`'); i >= 0 {
-			if j := strings.IndexByte(low[i+1:], '`'); j >= 0 {
-				if containsShellCommand(low[i+1 : i+1+j]) {
-					return "command substitution backtick"
-				}
-			}
+	//
+	// 同样要遍历**每一处**：`Set the ` + "`PATH`" + ` variable, then run ` + "`id`" + `
+	// 的第一对是普通变量名，真命令在第二对（审计实测原实现返回空）。
+	// 每个反引号都当作可能的起始（比严格配对更宽，但内容必须以命令名开头，
+	// 因此放宽不会引入"随便两个反引号就算注入"的误报）。
+	// 长命令体（闭合反引号在 32 字节之外）同样按窗口判，理由与上面 $() 一致。
+	for i := 0; ; {
+		k := strings.IndexByte(low[i:], '`')
+		if k < 0 {
+			break
+		}
+		start := i + k
+		i = start + 1 // 下一处候选从这一处后面开始，避免原地打转
+		seg := low[start+1:]
+		full := len(seg) > substProbe
+		if full {
+			seg = seg[:substProbe]
+		}
+		if j := strings.IndexByte(seg, '`'); j >= 0 {
+			seg = seg[:j]
+		} else if !full {
+			continue // 32 字节以内没有闭合反引号，不构成命令替换
+		}
+		if containsShellCommand(seg) {
+			return "command substitution backtick"
 		}
 	}
 	for i := 0; i < len(low); i++ {

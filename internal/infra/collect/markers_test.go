@@ -233,8 +233,12 @@ func TestScriptMarksDfFallbackAsOK(t *testing.T) {
 		t.Fatal("脚本输出里没有 @@DF 段")
 	}
 	body := sectionBody(out, "DF")
-	if !strings.HasPrefix(body, "@@OK") {
-		t.Errorf("df -B1 不可用但 df -P 有数据时应当打 @@OK，实际段体开头是 %q", firstLine(body))
+	// 必须精确是 @@OK1024（1024 字节块），不能只判前缀 —— `HasPrefix(body,"@@OK")`
+	// 同时匹配 `@@OK`（字节）与 `@@OK1024`，等于分不出"退回分支"与"-B1 分支"，
+	// 而这两个标记的语义差 1024 倍（audit44 那个 bug 就是两个分支都打了 @@OK）。
+	if got := firstMarker(body); got != markerYes1024 {
+		t.Errorf("df -B1 不可用、退回 df -P 拿到数据时应当打 %s（单位是 1024 字节块），实际 %q",
+			markerYes1024, got)
 	}
 	s, missing := ParseDetailed(out)
 	if hasStr(missing, "DF") {
@@ -370,12 +374,57 @@ func findPOSIXShell() string {
 	return ""
 }
 
-// runScript 在给定了 PATH 的环境里跑采集脚本，返回 stdout。
+// stubFunctionDefs 把 bin 目录里的替身变成**同名 shell 函数**，拼成一段前缀代码。
+//
+// 为什么不能用"把替身目录放进 PATH 靠前的位置"（复审 M2，实测）：
+//
+//   - git-bash 启动时会自己把 /mingw64/bin:/usr/bin 插到 PATH 最前面，替身目录
+//     永远轮不到 —— 实测 PATH 里塞进替身目录后 `command -v df` 仍是 /usr/bin/df。
+//     后果是 TestScriptMarksDfFallbackAsOK 在本机其实拿**真 GNU df** 跑绿：断言
+//     碰巧也成立，但与被测实现无关；
+//   - 真装了 ss / netstat 的机器上更糟：本该"命令不认参数 / 命令缺失"的用例会去问
+//     真工具，答案取决于那台机器此刻的连接表 —— 假绿与假红都可能。
+//
+// 命令解析里**函数优先于 PATH**，所以只有定义函数才是真的替换。
+//
+// 每个替身都包在**子 shell** 里，因为替身体本来写的是 `exit 1`（"命令失败"），
+// 而 `exit`/`return` 出现在函数里会把整份采集脚本带走 —— 后面的段一个都不会输出。
+// 子 shell 让"退出码"语义与原来的独立进程完全一致，替身体一个字都不用改。
+//
+// 没有替身的命令定义成"存在但失败、空输出"（exit 127）：脚本里 DF/CONN/SS 这几段
+// 只看输出与退出码，这样与"命令不存在"等价。PS/PROCCOUNT 有 `command -v` 前置
+// 守卫，会因此落到 @@EMPTY 而不是 @@NO —— 这两段在脚本级测试里都自带替身，
+// 不影响任何断言，换来的是"真命令绝不会被跑到"这条硬保证。
+func stubFunctionDefs(t *testing.T, bin string) string {
+	t.Helper()
+	var b strings.Builder
+	for _, name := range []string{"df", "ps", "ss", "netstat"} {
+		b.WriteString(name + "() {\n  (\n")
+		body, err := os.ReadFile(filepath.Join(bin, name))
+		if err != nil {
+			b.WriteString("    exit 127\n")
+		} else {
+			for _, l := range strings.Split(strings.TrimRight(string(body), "\n"), "\n") {
+				// shebang 在函数体里没有意义（留着也只是个注释，但会让人以为还是脚本）
+				if strings.HasPrefix(strings.TrimSpace(l), "#!") {
+					continue
+				}
+				b.WriteString("    " + l + "\n")
+			}
+		}
+		b.WriteString("  )\n}\n")
+	}
+	return b.String()
+}
+
+// runScript 在"命令被替身覆盖"的环境里跑采集脚本，返回 stdout。
+//
+// 替身的生效**只**取决于上面那组函数，与 PATH 无关（见 stubFunctionDefs）。
+// PATH 里仍然带着替身目录 + /usr/bin:/bin：脚本自己还要用 grep / cat / head /
+// uname / date，那些必须解析得到。
 func runScript(t *testing.T, shell, bin string) string {
 	t.Helper()
-	cmd := exec.Command(shell, "-c", Script)
-	// 只留替身目录 + 系统目录：脚本要用的 grep/cat/head/uname/date 得在，
-	// 而 ss/netstat/df/ps 要被"卸载"掉。
+	cmd := exec.Command(shell, "-c", stubFunctionDefs(t, bin)+Script)
 	cmd.Env = append(os.Environ(), "PATH="+bin+";/usr/bin:/bin")
 	done := make(chan struct{})
 	var out []byte

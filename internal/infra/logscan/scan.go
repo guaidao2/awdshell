@@ -1,9 +1,12 @@
 package logscan
 
 import (
+	"context"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -148,20 +151,72 @@ type IPCount struct {
 
 // Result 是一次扫描的结果。
 type Result struct {
-	Path         string         `json:"path"`
-	Scanned      int            `json:"scanned"`
-	Hits         []Hit          `json:"hits"`
-	BySeverity   map[string]int `json:"by_severity"`
-	ByCategory   map[string]int `json:"by_category"`
-	TopIPs       []IPCount      `json:"top_ips"`
-	HitLineCount int            `json:"hit_line_count"`
-	DecodedHits  int            `json:"decoded_hits"`
-	RuleCount    int            `json:"rule_count"`
+	Path       string         `json:"path"`
+	Scanned    int            `json:"scanned"`
+	Hits       []Hit          `json:"hits"`
+	BySeverity map[string]int `json:"by_severity"`
+	ByCategory map[string]int `json:"by_category"`
+	// TopIPs 是**这次扫描看到的**命中里出现最多的来源 IP。
+	//
+	// 口径说明（复审 提示1）：它和 HitLineCount 统计的是"扫到的事实"，
+	// **包含**达上限后没记进 Hits 的那部分（DroppedHits）；而 BySeverity /
+	// ByCategory / DecodedHits 守的是另一个不变量 —— 只统计真正记进 Hits 的
+	// 条目，"三个计数之和 == len(Hits)"。两者并列显示时容易被读成"命中列表的
+	// 统计"，所以这里写明：**列表会截断，扫描事实不会**。
+	// 调用方若要"列出来的那些命中"的分布，直接用 Hits 自己算。
+	TopIPs []IPCount `json:"top_ips"`
+	// HitLineCount 是"有命中的**行数**"（同一行命中多条规则只算一行，
+	// 与 TopIPs 同口径：含被截断那些行）。
+	HitLineCount int `json:"hit_line_count"`
+	DecodedHits  int `json:"decoded_hits"`
+	RuleCount    int `json:"rule_count"`
 	// Correlations 是跨行关联出来的发现（爆破统计、失败后成功等）。
 	Correlations []Correlation `json:"correlations"`
 	// Kind 是本次实际使用的规则集（web / system / all），KindAuto 表示它是自动推断的。
 	Kind     string `json:"kind"`
 	KindAuto bool   `json:"kind_auto"`
+	// 以下三个字段回答同一个问题："这个结果完整吗？"
+	//
+	// 为什么必须有：日志内容由攻击者控制，一行"什么都有"的载荷可以同时命中
+	// 几十条规则 —— 审计实测 2000 行 → 62000 条命中、JSON 37.3MB、2.65 秒。
+	// 静默截断等于让调用方以为自己看到了全部；所以截断要**如实标记**，
+	// 界面上要能表达"已截断"（调用方读 Truncated / TruncatedReason 即可）。
+	//
+	// Truncated 为 true 表示结果不完整：命中数达上限，或时间预算耗尽提前收工。
+	Truncated bool `json:"truncated"`
+	// TruncatedReason 是一句能直接显示给人看的原因（空串 = 结果完整）。
+	TruncatedReason string `json:"truncated_reason,omitempty"`
+	// DroppedHits 是达上限后**没有**记进 Hits 的命中条数（仍然计数，不静默丢）。
+	DroppedHits int `json:"dropped_hits,omitempty"`
+	// StoppedAtLine 是时间预算耗尽时停下的行号（1 起；0 = 全部扫完）。
+	StoppedAtLine int `json:"stopped_at_line,omitempty"`
+}
+
+// DefaultMaxHits 是单次扫描记入 Hits 的条数上限。
+//
+// 5000 条：正常日志（哪怕被打得很惨）很少超过；真超了就说明这一批日志里
+// 攻击载荷密度极高，多出来的明细落库也只会把库和 JSON 撑爆。
+const DefaultMaxHits = 5000
+
+// ScanLimits 是 Scan 的**可选**上限；零值等于不限（与旧行为完全一致）。
+//
+// 为什么做成"可选的额外入口"而不是改 Scan 的签名：Scan/ScanWithKind 的既有
+// 调用方（service/logscan.go 等）不该被这次修复惊动，而整次扫描的时间预算
+// 又必须能由调用方指定（只有它知道本次请求还能花多久）。
+type ScanLimits struct {
+	// MaxDuration 是整次扫描的时间预算（0 = 不限）。
+	//
+	// 现实依据：单行最坏 52ms（8KB 分号）、内容正常但很长的行 21ms/行，
+	// 而 service 层允许 20000 行 —— 单次扫描可以跑到几十秒，界面在这期间
+	// 是没有任何反馈的。预算耗尽时**停下来并如实标记**，而不是继续跑完。
+	//
+	// 粒度说明：预算在**行之间**检查，所以最后一行可能超出预算（最坏约
+	// 单行 52ms）；行内不打断（语义算子是整行扫描，中途停下只会得到半个结论）。
+	MaxDuration time.Duration
+	// Ctx 可取消这次扫描（nil = 不监听）。
+	Ctx context.Context
+	// MaxHits 是命中条数上限（<=0 用 DefaultMaxHits）。
+	MaxHits int
 }
 
 // Scan 逐行扫描文本。
@@ -177,8 +232,10 @@ const maxLineBytes = 8 << 10
 
 // Scan 扫描文本，返回命中结果。日志类型由它自己按路径与内容推断
 // （等价于 ScanWithKind(..., "")），保留这个签名只为不惊动既有调用方。
+//
+// 不限时间、按 DefaultMaxHits 限制命中条数（超了会在 Result 里如实标记）。
 func Scan(text, path string, rules []Rule) Result {
-	return ScanWithKind(text, path, rules, "")
+	return ScanWithLimits(text, path, rules, "", ScanLimits{})
 }
 
 // ScanWithKind 扫描文本，用调用方**已经算好**的日志类型决定要不要跑跨行认证关联。
@@ -193,12 +250,37 @@ func Scan(text, path string, rules []Rule) Result {
 //
 // 不做成"只读 Result.Kind"：Result 是 Scan 的返回值，进来时还是空的，没有可读的 kind。
 func ScanWithKind(text, path string, rules []Rule, kind string) Result {
+	return ScanWithLimits(text, path, rules, kind, ScanLimits{})
+}
+
+// ScanWithLimits 是带**可选**预算/上限的扫描入口。
+//
+// 这是给 service 层接线的口子（service/logscan.go 不在本次修复范围）：
+// 把整次扫描的时间预算、可取消的 ctx、命中条数上限传进来即可；
+// 传零值 ScanLimits{} 与 ScanWithKind 行为完全一致。
+func ScanWithLimits(text, path string, rules []Rule, kind string, lim ScanLimits) Result {
 	if rules == nil {
 		rules = AllRules()
 	}
 	kindAuto := kind == "" || kind == KindAuto
 	if kindAuto {
 		kind = GuessLogKind(path, text)
+	}
+	maxHits := lim.MaxHits
+	if maxHits <= 0 {
+		maxHits = DefaultMaxHits
+	}
+	var deadline time.Time
+	if lim.MaxDuration > 0 {
+		deadline = time.Now().Add(lim.MaxDuration)
+	}
+	overBudget := func() bool {
+		if lim.Ctx != nil {
+			if err := lim.Ctx.Err(); err != nil {
+				return true
+			}
+		}
+		return !deadline.IsZero() && time.Now().After(deadline)
 	}
 	res := Result{
 		Path:       path,
@@ -213,9 +295,18 @@ func ScanWithKind(text, path string, rules []Rule, kind string) Result {
 	}
 	ipCount := map[string]int{}
 	hitLines := map[int]bool{}
+	var budgetStoppedAt int
 
 	lines := strings.Split(text, "\n")
 	for i, raw := range lines {
+		// 预算/取消检查放在行之间：整行不打断（语义算子是整行扫描），
+		// 最坏情况是最后一行多花 ~50ms。
+		if !deadline.IsZero() || lim.Ctx != nil {
+			if overBudget() {
+				budgetStoppedAt = i + 1
+				break
+			}
+		}
 		line := strings.TrimRight(raw, "\r")
 		// 单行长度上限：日志内容在 AWD 场景完全由攻击者控制，而语义算子里有对
 		// "整行剩余文本"的扫描（containsShellChars 对每个分隔符都要处理剩余部分）。
@@ -225,8 +316,19 @@ func ScanWithKind(text, path string, rules []Rule, kind string) Result {
 		// 这一刀必须**退到 rune 边界**：直接 line[:8<<10] 会把正好跨在第 8192
 		// 字节上的多字节字符砍成半个，切出来的行本身就是非法 UTF-8，后面的匹配
 		// 与证据行全建在坏串上。
+		//
+		// 而且**不能只留头**：nginx 的 URI / Referer / User-Agent 都是攻击者可控
+		// 字段（各自可到 8k），把载荷推到第 8192 字节之后就能整体绕过检测 ——
+		// 审计实测：填充 8000 字节仍命中 WEB-SCANNER，填充 8300（载荷偏移 8375）
+		// 就只剩无关的 LOG-ENCODED，且不产生任何异常提示。
+		//
+		// 改成头尾各留一半，**但把总预算压到 maxLineBytes/2**：只留头是 8KB，
+		// 头尾都留就是 16KB，单行耗时直接翻倍（实测 200 行 10 万分号从 1.7s
+		// 涨到 3.7s）。真实日志行远小于 4KB，而攻击者灌的长行载荷顶在尾部，
+		// 尾部这 2KB 足够覆盖。
 		if len(line) > maxLineBytes {
-			line = cutAtRuneBoundary(line, maxLineBytes)
+			half := maxLineBytes / 4
+			line = cutAtRuneBoundary(line, half) + "\n" + tailAtRuneBoundary(line, half)
 		}
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -293,6 +395,14 @@ func ScanWithKind(text, path string, rules []Rule, kind string) Result {
 		ts := extractTime(line)
 
 		for _, m := range matched {
+			// 命中条数上限：超出的部分**只计数不记录**，并在 Result 上标记
+			// （Truncated / DroppedHits）—— 静默截断会让调用方以为看到了全部。
+			// BySeverity / ByCategory / DecodedHits 只统计真正记进 Hits 的条目，
+			// 保证"三个计数之和 == len(Hits)"这个不变量继续成立。
+			if len(res.Hits) >= maxHits {
+				res.DroppedHits++
+				continue
+			}
 			if m.decoded {
 				res.DecodedHits++
 			}
@@ -314,6 +424,42 @@ func ScanWithKind(text, path string, rules []Rule, kind string) Result {
 	}
 	res.HitLineCount = len(hitLines)
 
+	// 结果不完整时如实标记（命中封顶 / 时间预算耗尽）。
+	var why []string
+	if res.DroppedHits > 0 {
+		why = append(why, fmt.Sprintf("命中数已达上限 %d 条，另有 %d 条命中未记录", maxHits, res.DroppedHits))
+	}
+	if budgetStoppedAt > 0 {
+		res.StoppedAtLine = budgetStoppedAt
+		total := len(lines)
+		if total > 0 && lines[total-1] == "" {
+			total-- // Split 的尾元素是末尾换行造成的空串，不算一行
+		}
+		// 取消与超时要分开说：两者的处理动作不同（一个是用户/上层叫停，
+		// 一个是机器跑不完），糊成一句会让人以为是超时。
+		//
+		// 还没开始就停下的情况单独成句（复审 提示2）：预算检查在**行之间**，
+		// 第 1 行之前那次检查就会 break（budgetStoppedAt = 1），
+		// 以前按 `budgetStoppedAt-1` 打出来是"只检测到第 0 行" —— 一句听起来
+		// 像"扫了 0 行也算扫过"的话，实际含义是"一行都没看过"。
+		stopped := budgetStoppedAt - 1
+		var tail string
+		if stopped <= 0 {
+			tail = fmt.Sprintf("尚未开始（共 %d 行），所有行都未检测", total)
+		} else {
+			tail = fmt.Sprintf("只检测到第 %d 行（共 %d 行），其余行未检测", stopped, total)
+		}
+		if lim.Ctx != nil && lim.Ctx.Err() != nil {
+			why = append(why, "扫描被取消，"+tail)
+		} else {
+			why = append(why, "扫描时间预算耗尽，"+tail)
+		}
+	}
+	if len(why) > 0 {
+		res.Truncated = true
+		res.TruncatedReason = strings.Join(why, "；") + "，本次结果不完整"
+	}
+
 	// 跨行关联：单行规则看不出的模式（同一来源反复失败、失败多次后登录成功等）。
 	//
 	// **只在非 Web 日志上算**：AnalyzeAuth 找的是 sshd / sudo 那套结构，而 WEB 日志的
@@ -324,7 +470,9 @@ func ScanWithKind(text, path string, rules []Rule, kind string) Result {
 	//
 	// 判据用**参数传入的 kind**（调用方已算好），不再自己再猜一次 —— 两次判断不一致
 	// 时就会在 web 行上跑认证关联（混合日志前 300 行 syslog 占多数即可触发）。
-	if kind != KindWeb {
+	//
+	// 预算已经用完就不再跑：关联分析本身也要逐行跑正则，继续算等于把时间预算作废。
+	if budgetStoppedAt == 0 && kind != KindWeb {
 		res.Correlations = AnalyzeAuth(lines, DefaultThresholds())
 	}
 
@@ -412,6 +560,21 @@ func truncate(s string, n int) string {
 		return suffix
 	}
 	return s[:body] + suffix
+}
+
+// tailAtRuneBoundary 取 s 的**末尾**不超过 max 字节的部分，且不从多字节字符中间切。
+//
+// 与 cutAtRuneBoundary 配对：日志行被截断时，攻击者可控的长字段（URI / Referer /
+// User-Agent）通常顶在被截掉的那一端，只留头会整体漏检。
+func tailAtRuneBoundary(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	i := len(s) - max
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // cutAtRuneBoundary 把 s 砍到**不超过** max 字节，且不切断多字节字符。

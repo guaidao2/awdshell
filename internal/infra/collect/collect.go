@@ -13,8 +13,12 @@ import (
 // 这里漏出去的）：
 //
 //	@@OK     命令跑通了，而且**真的有输出**
-//	@@EMPTY  命令跑通了，但输出就是空的（ss 确实 0 条监听、这台机器真的没进程）
-//	@@NO     命令不存在 / 无条件不成立（精简镜像没有 ss、BusyBox 不认 ps -e）
+//	@@OK1024 同 @@OK，但数字的单位是 **1024 字节块**（df -B1 不被支持时的
+//	         退回分支），解析端要乘 1024 才是字节
+//	@@EMPTY  命令跑通了（退出码 0），但输出就是空的（ss 确实 0 条监听、
+//	         这台机器真的没进程）
+//	@@NO     命令不存在 / 条件不成立（精简镜像没有 ss、BusyBox 不认 ps -e
+//	         / 老 iproute2 不认 ss -H，命令以非 0 退出）
 //	          —— **解析端遇到它可以直接报错**（"连命令都没有，还解析什么"）
 //
 // 为什么必须分开：精简镜像 / BusyBox 上 `ps --sort`、`df -B1`、`ss` 这些可能根本
@@ -24,6 +28,19 @@ import (
 // **看起来完全正常的 0**（界面上写"0 个进程"），而它其实只是命令没跑通。
 // 缺失的段由 ParseDetailed 汇总成 Missing，调用方据此标注"未采集到"。
 const Script = `LC_ALL=C
+# conn_row 判断一段文本里有没有"地址:端口"形态的数据行。
+#
+# 为什么需要它（审计 中-6）：ss / netstat 的**空输出**有两种完全不同的含义 ——
+#   ① 命令跑通了、这台机器确实一条连接/监听都没有；
+#   ② 命令不认这些参数（老 iproute2 没有 -H）或权限不足，什么都没给。
+# 两者都表现成"stdout 空"，只看 grep -q . 分不开，于是都被判成 @@EMPTY
+#（"确实是空"）——界面画一张空表，用户以为这台机器没有外联。
+# 判据：命令的 canonical 形态空输出时，再看它的**非 canonical 形态有没有表头**
+#（表头 = 工具在正常工作），以及有没有数据行。表头在、数据行不在 → 真的是空；
+# 连表头都没有 → 这个工具根本没给可用输出，报 @@NO。
+# 数据行的形态是"地址:端口后跟空白或行尾"——Local Address:Port 这种**列名**
+# 不算数据行（它是 ss 的表头，:Port 不是数字），否则空机器会被判成有数据。
+conn_row() { grep -Eq ':[0-9]+([[:space:]]|$)'; }
 echo "@@STAT"
 grep '^cpu' /proc/stat 2>/dev/null
 echo "@@MEM"
@@ -45,12 +62,16 @@ if command -v df >/dev/null 2>&1; then
     echo "@@OK"
     df -P -B1 2>/dev/null | head -n 64
   elif df -P 2>/dev/null | head -n 64 | grep -q .; then
-    # 退回分支：数据是有的（只是 -B1 不被支持，块大小按 1024 算），必须打 @@OK，
+    # 退回分支：数据是有的（只是 -B1 不被支持），必须打一个"采到了"的标记，
     # 否则界面上会说"未采集到"而用户明明看得见 df 的输出。
-    echo "@@OK"
+    # **标记必须与上面那个不同**：POSIX 的 df -P 默认按 1024 字节块给数，
+    # 而上面 -B1 给的是字节 —— 两个分支都打 @@OK 的话解析端无从分辨，
+    # 界面把 2097152（块）当字节画成 2.0 MB，实际是 2 GiB（审计 中-4）。
+    # 这里用 @@OK1024 告诉解析端"按 1024 乘"。
+    echo "@@OK1024"
     df -P 2>/dev/null | head -n 64
   else
-    echo "@@EMPTY"
+    echo "@@NO"
   fi
 else
   echo "@@NO"
@@ -105,47 +126,91 @@ else
 fi
 echo "@@CONN"
 # ss 优先，BusyBox 上没有就用 netstat；两个都没有时 @@NO 让界面说实话。
-# 顺序是"命令在不在"→"有没有数据"：ss 在但权限不足（拿不到进程信息）时同样可能
-# 输出为空，那种情况要退回 netstat，而不是报"未采集到"。
+# **@@EMPTY 只留给"命令真的跑通、确实是空"**（审计 中-6）：老判据是
+# command -v ss 加上 "ss -tnpH | grep -q ."，而 command -v 只证明命令在 ——
+# 空的 stdout 既可能是"确实一条连接都没有"，也可能是"参数不被支持/权限不足"，
+# 混成一个 @@EMPTY，界面就画一张空连接表，用户以为这台机器没有外联。
+#
+# 现在的判据（见脚本开头的 conn_row）：
+#   有数据行                                    → @@OK
+#   没数据行，但另一形态给了表头（工具在工作）    → @@EMPTY（确实是空）
+#   连表头都没有（工具根本不认/读不到）          → @@NO（没采到，界面说实话）
+#
+# **非 canonical 形态必须用 conn_row 判，不能用 grep -q .**：它带着表头，
+# grep -q . 永远为真 —— 于是"表头 + 驱动命令没跑动"也会被判成 @@OK（实测）。
+# 复审 中4：netstat 的回退分支正是拿 grep -q . 判的，实测"没有 ss、netstat 只有
+# 表头"（这台机器确实没有连接）被报成 @@CONN @@OK / @@OK 而不是 @@EMPTY。
+# 现在**所有非 canonical 形态（ss -tnp / netstat）统一用 conn_row**。
+#
+# netstat 一律带 -p（复审 低3）：netstat -tn 没有 -p，进程名那一列永远是空的，
+# 而"哪个进程在往外连"正是排查外联时最需要的一列（非 root 下内核不给 pid，
+# netstat 自己会打 -，解析端 trimProc 已有兜底）。
 if command -v ss >/dev/null 2>&1; then
-  if ss -tnpH 2>/dev/null | head -n 120 | grep -q .; then
+  if ss -tnpH 2>/dev/null | head -n 120 | conn_row; then
+    # canonical 形态（-H = 不要表头）也必须判**数据行**：目标机的 ss 可能
+    # "静默忽略 -H"（老 iproute2），此时这段输出带表头，而 grep -q . 恒真 ——
+    # 实测没有连接时会被报成 @@CONN @@OK（界面画空表却说"采到了"）。
     echo "@@OK"
     ss -tnpH 2>/dev/null | head -n 120
-  elif command -v netstat >/dev/null 2>&1 && netstat -tn 2>/dev/null | head -n 120 | grep -q .; then
+  elif ss -tnp 2>/dev/null | conn_row; then
+    # -H 不被支持（或它静默不生效），但退回的形态确实给了数据行
     echo "@@OK"
-    netstat -tn 2>/dev/null | head -n 120
-  else
+    ss -tnp 2>/dev/null | head -n 120
+  elif command -v netstat >/dev/null 2>&1 && netstat -tnp 2>/dev/null | head -n 120 | conn_row; then
+    echo "@@OK"
+    netstat -tnp 2>/dev/null | head -n 120
+  elif ss -tnp 2>/dev/null | head -n 1 | grep -q . ||
+       { command -v netstat >/dev/null 2>&1 && netstat -tnp 2>/dev/null | head -n 1 | grep -q .; }; then
+    # 有表头、没有数据行：工具正常，这台机器确实没有连接
     echo "@@EMPTY"
+  else
+    echo "@@NO"
   fi
 elif command -v netstat >/dev/null 2>&1; then
-  if netstat -tn 2>/dev/null | head -n 120 | grep -q .; then
+  if netstat -tnp 2>/dev/null | head -n 120 | conn_row; then
     echo "@@OK"
-    netstat -tn 2>/dev/null | head -n 120
-  else
+    netstat -tnp 2>/dev/null | head -n 120
+  elif netstat -tnp 2>/dev/null | head -n 1 | grep -q .; then
     echo "@@EMPTY"
+  else
+    echo "@@NO"
   fi
 else
   echo "@@NO"
 fi
 echo "@@SS"
-# 同上。**@@EMPTY 是这里的重点**：ss 正常执行、确实一条监听都没有时（比如刚装好的
+# 同 CONN。**@@EMPTY 是这里的重点**：ss 正常执行、确实一条监听都没有时（比如刚装好的
 # 容器里 sshd 还没起），以前会被判成"未采集到：SS"，把"真的是空"误报成"没采到"。
+# 反之也不能把"命令不认参数"误报成"确实是空"——退回不带 -H 的形态；仍无数据时再看
+# 有没有表头，分 "@@EMPTY（跑通了、确实是空）"与 "@@NO（跑不动）"。
+# 与 CONN 一样，**四个分支统统判数据行（conn_row）**：-H 被静默忽略时输出带表头，
+# grep -q . 会把"只有表头"当成有数据（复审 中4 的第二个症状）。
 if command -v ss >/dev/null 2>&1; then
-  if ss -H -tunlp 2>/dev/null | head -n 40 | grep -q .; then
+  if ss -H -tunlp 2>/dev/null | head -n 40 | conn_row; then
     echo "@@OK"
     ss -H -tunlp 2>/dev/null | head -n 40
-  elif command -v netstat >/dev/null 2>&1 && netstat -tunlp 2>/dev/null | head -n 40 | grep -q .; then
+  elif ss -tunlp 2>/dev/null | conn_row; then
+    # -H 不被支持：退回不带 -H 的形态（表头行由解析端按段跳过）。
+    # 判据同样是 conn_row：这段输出带表头，grep -q . 会把"只有表头"也当成有数据。
+    echo "@@OK"
+    ss -tunlp 2>/dev/null | head -n 40
+  elif command -v netstat >/dev/null 2>&1 && netstat -tunlp 2>/dev/null | head -n 40 | conn_row; then
     echo "@@OK"
     netstat -tunlp 2>/dev/null | head -n 40
-  else
+  elif ss -tunlp 2>/dev/null | head -n 1 | grep -q . ||
+       { command -v netstat >/dev/null 2>&1 && netstat -tunlp 2>/dev/null | head -n 1 | grep -q .; }; then
     echo "@@EMPTY"
+  else
+    echo "@@NO"
   fi
 elif command -v netstat >/dev/null 2>&1; then
-  if netstat -tunlp 2>/dev/null | head -n 40 | grep -q .; then
+  if netstat -tunlp 2>/dev/null | head -n 40 | conn_row; then
     echo "@@OK"
     netstat -tunlp 2>/dev/null | head -n 40
-  else
+  elif netstat -tunlp 2>/dev/null | head -n 1 | grep -q .; then
     echo "@@EMPTY"
+  else
+    echo "@@NO"
   fi
 else
   echo "@@NO"
@@ -265,7 +330,13 @@ var criticalSections = []string{"STAT", "MEM"}
 // optionalSections 是"有更好、没有也不影响核心指标"的段。
 // 它们的缺失会被记进 Snapshot.Missing，由调用方决定是否提示（例如精简镜像
 // 没有 ss，排查外联时该提示"监听/连接列表未采集到"而不是画一张空表）。
-var optionalSections = []string{"DF", "PS", "CONN", "SS", "NET", "OSINFO", "KERNEL", "PROCCOUNT"}
+//
+// UPTIME / TZ 也必须在这里（审计 低-4）：它们以前既不在关键段也不在可选段，
+// 采不到时**什么都不说** —— UptimeSec=0 / TimeZone="" 静默进界面，
+// 而 0 秒开机时间、空时区在界面上看起来像真实值。
+var optionalSections = []string{
+	"DF", "PS", "CONN", "SS", "NET", "OSINFO", "KERNEL", "PROCCOUNT", "UPTIME", "TZ",
+}
 
 // Parse 解析采集脚本的输出，返回采样结果。
 //
@@ -297,9 +368,13 @@ func ParseDetailed(out string) (Snapshot, []string) {
 	// okSections 记下"脚本说这一段采到了（@@OK）"的名字；后面的核对要用它，
 	// 而不是回头去看段体 —— 那时标记已经被 stripMarker 去掉了。
 	okSections := map[string]bool{}
+	// dfScale 记下 DF 段的数字该乘多少才是字节：@@OK1024（POSIX df -P 的
+	// 1024 字节块）要乘 1024，@@OK（df -B1）就是字节。两个分支都打 @@OK 的话
+	// 解析端无从分辨，界面把 2 GiB 画成 2.0 MB（审计 中-4）。
+	dfScale := uint64(1)
 
-	// 命令是否存在由脚本自己标记（@@OK / @@EMPTY / @@NO）：先收一遍声明的缺失段，
-	// 再叠加"段根本没出现"与"段是空的"两种情况。
+	// 命令是否存在由脚本自己标记（@@OK / @@OK1024 / @@EMPTY / @@NO）：先收一遍
+	// 声明的缺失段，再叠加"段根本没出现"与"段是空的"两种情况。
 	for _, name := range append(append([]string{}, criticalSections...), optionalSections...) {
 		body, present := sections[name]
 		if !present {
@@ -313,11 +388,14 @@ func ParseDetailed(out string) (Snapshot, []string) {
 		// 无条件砍掉第一行会把 `cpu ...` 那一行数据丢掉（实测 Collected 直接变 false）。
 		marker := firstMarker(body)
 		switch marker {
-		case markerYes, markerEmpty, markerNo:
+		case markerYes, markerYes1024, markerEmpty, markerNo:
 			body = stripMarker(body)
 			sections[name] = body
 		default:
 			marker = ""
+		}
+		if marker == markerYes1024 {
+			dfScale = 1024
 		}
 
 		switch marker {
@@ -325,7 +403,7 @@ func ParseDetailed(out string) (Snapshot, []string) {
 			// 命令不在 / 不认这些参数：没采到
 			s.Missing = append(s.Missing, name)
 			continue
-		case markerYes:
+		case markerYes, markerYes1024:
 			okSections[name] = true
 		}
 		// 到底什么叫 Missing：**这一段的数据没拿到**。
@@ -366,7 +444,7 @@ func ParseDetailed(out string) (Snapshot, []string) {
 		s.UptimeSec = parseUptime(v)
 	}
 	if v, ok := sections["DF"]; ok {
-		s.Disks = parseDF(v)
+		s.Disks = parseDFScaled(v, dfScale)
 	}
 	if v, ok := sections["NET"]; ok {
 		s.Net = parseNetDev(v)
@@ -458,10 +536,27 @@ func unparsedProblems(s Snapshot, okSections map[string]bool) []string {
 //	@@EMPTY  命令在、跑通了，但输出就是空的（"真的是空"，不是"没采到"）
 //	@@NO     命令不在 / 不认这些参数（"没采到"）
 const (
-	markerYes   = "@@OK"
-	markerEmpty = "@@EMPTY"
-	markerNo    = "@@NO"
+	markerYes = "@@OK"
+	// markerYes1024 是"采到了，但数字的单位是 1024 字节块"（df -B1 不可用时的
+	// 退回分支）。它必须是**独立的标记**而不是再加一层判据：脚本打的就是这个
+	// 字符串，解析端只能靠它分辨两个 df 分支的单位（审计 中-4）。
+	markerYes1024 = "@@OK1024"
+	markerEmpty   = "@@EMPTY"
+	markerNo      = "@@NO"
 )
+
+// isMarker 判断一个 token 是不是段标记。
+//
+// 为什么不能在各处各写一遍字符串比较：以前 @@OK / @@EMPTY / @@NO 的比较散在
+// firstMarker 与 splitSections 两处，**新增一个标记（@@OK1024）时最容易只改一处** ——
+// 另一处就会把它当成"未知段名"凭空报一条 Problems，段体里也留着标记行。
+func isMarker(s string) bool {
+	switch s {
+	case markerYes, markerYes1024, markerEmpty, markerNo:
+		return true
+	}
+	return false
+}
 
 // firstMarker 取段体第一行的标记（没有标记时返回空串）。
 func firstMarker(body string) string {
@@ -530,12 +625,11 @@ func splitSections(out string) (map[string]string, []string) {
 				cur = name
 				continue
 			}
-			// @@OK / @@EMPTY / @@NO 是状态标记（段体内容），**不是段名**：
+			// @@OK / @@OK1024 / @@EMPTY / @@NO 是状态标记（段体内容），**不是段名**：
 			// 把它们当成"未知段名"会凭空冒出一堆假提示。除此之外的 @@XXX
 			// 才是"白名单没同步"的信号：内容仍并进当前段（行为与以前一致，
 			// 不改变已有解析结果），但要记一条。
-			if name != "" && !strings.HasPrefix(name, "@") &&
-				name != "OK" && name != "EMPTY" && name != "NO" && !seen[name] {
+			if name != "" && !strings.HasPrefix(name, "@") && !isMarker("@@"+name) && !seen[name] {
 				seen[name] = true
 				unknown = append(unknown, name)
 			}
@@ -646,14 +740,25 @@ func parseUptime(v string) float64 {
 	return f
 }
 
-// parseDF 解析 df -P [-B1] 输出。
+// parseDF 解析 df -P [-B1] 输出（数字按字节算，即 @@OK 分支）。
+func parseDF(v string) []DiskUsage { return parseDFScaled(v, 1) }
+
+// parseDFScaled 解析 df 输出，并把数字乘上 scale 换成字节。
+//
+// 为什么需要 scale：`df -P -B1` 是字节，而 `df -P`（POSIX 默认）是 **1024 字节块**。
+// 脚本的退回分支以前打的是同一个 @@OK，解析端无从分辨，于是
+// `overlay 2097152 1048576 1048576 50% /`（= 2 GiB）在界面上画成 2.0 MB
+// （审计 中-4 实测）。现在退回分支打 @@OK1024，ParseDetailed 据此传 1024。
 //
 // 为什么不能再用 strings.Fields 取最后一列：`df -P` 的列是固定的
 // （Filesystem 1024-blocks Used Available Capacity Mounted on），最后一列是
 // **挂载点**，而挂载点可以含空格。实测 `/mnt/my data` 用 Fields 切出来
 // 最后一列是 `data`，界面上的挂载点就变成了 data。
 // 改法：按列边界切——前 5 列不含空格，第 6 列起（到行尾）整段是挂载点。
-func parseDF(v string) []DiskUsage {
+func parseDFScaled(v string, scale uint64) []DiskUsage {
+	if scale == 0 {
+		scale = 1
+	}
 	out := []DiskUsage{}
 	for _, line := range strings.Split(v, "\n") {
 		line = strings.TrimSpace(line)
@@ -672,6 +777,7 @@ func parseDF(v string) []DiskUsage {
 		if err1 != nil || err2 != nil || err3 != nil {
 			continue
 		}
+		total, used, avail = total*scale, used*scale, avail*scale
 
 		// 第 6 列起整段是挂载点。用索引而不是 Join(f[5:], " ")：
 		// 后者会把挂载点里的连续空格压成一个，中文/带空格的路径会变形。
@@ -730,11 +836,18 @@ func parseNetDev(v string) []NetIface {
 }
 
 // parsePS 解析 ps 输出（pid ppid user pcpu pmem rss stat comm args）。
+//
+// 表头行**靠结构过滤，不靠"跳首行"**（复审 提示3）：以前写的是 `if i == 0 { continue }`，
+// 它依赖一个隐式契约 —— 传进来的段体第一行一定是表头，而这件事只是"目前成立"：
+// 段体在 ParseDetailed 里被 stripMarker 去掉 `@@OK` / `@@NO` 标记之后，第一行
+// 恰好是 ps 的表头。契约一旦被破坏（段体没被剥离标记、或 ps 换了输出形态），
+// 那一行**真实进程**会被静默吃掉一行。而表头本来就过不了下面两道判据
+// （字段数 < 8、第一列不是数字），所以直接不跳更稳。
 func parsePS(v string) []ProcInfo {
 	out := []ProcInfo{}
 	lines := strings.Split(v, "\n")
-	for i, line := range lines {
-		if i == 0 || strings.TrimSpace(line) == "" {
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		fields := strings.Fields(line)
@@ -767,7 +880,7 @@ func parsePS(v string) []ProcInfo {
 //
 //	ESTAB 0 0 10.0.0.5:22 10.0.0.1:54321 users:(("sshd",pid=123,fd=3))
 //
-// netstat -tn 的输出列序不同，这里按"能找到两段地址"来兜底。
+// netstat -tnp 的输出列序不同，这里按"能找到两段地址"来兜底。
 func parseConns(v string) []Conn {
 	out := []Conn{}
 	for _, line := range strings.Split(v, "\n") {
@@ -821,9 +934,11 @@ func parseConns(v string) []Conn {
 			if j := strings.Index(rest, "\""); j > 0 {
 				proc = rest[:j]
 			}
-		} else if strings.HasPrefix(strings.ToLower(state), "tcp") {
-			// netstat 形态没有进程信息
-			proc = ""
+		} else {
+			// netstat 形态（没有 ss 的 users:(("name")) 段）：进程信息是最后一列
+			// `pid/name`（-p 才带），可能是 `-`（内核套接字）。同 trimProc 的说明 ——
+			// BusyBox 目标上没有 ss，这一栏以前恒为空（审计 低-1）。
+			proc = trimProc(fields[len(fields)-1])
 		}
 
 		out = append(out, Conn{
@@ -913,7 +1028,14 @@ func splitAddrPort(s string) (string, int) {
 	return addr, port
 }
 
-// trimProc 从 `users:(("nginx",pid=123,fd=6))` 里取进程名。
+// trimProc 从两行形态里取进程名：
+//
+//	ss      : users:(("nginx",pid=123,fd=6))   → nginx
+//	netstat : tcp ... LISTEN 123/sshd          → sshd
+//	          （还有一个变体是 `-`，表示内核持有的套接字，此时没有进程名）
+//
+// 为什么必须两种都认（审计 低-1）：只认 ss 形态时，BusyBox 目标（没有 ss、
+// 只有 netstat）上的进程名列**恒为空** —— 排查外联时最需要的那一栏正好是空的。
 func trimProc(s string) string {
 	if s == "" {
 		return ""
@@ -922,6 +1044,19 @@ func trimProc(s string) string {
 		rest := s[i+3:]
 		if j := strings.Index(rest, "\""); j > 0 {
 			return rest[:j]
+		}
+	}
+	// netstat 形态：最后一列是 pid/name（-p 才带）。取最后一个字段再切出名字。
+	for _, f := range strings.Fields(s) {
+		if f == "-" {
+			continue // 内核套接字，没有进程
+		}
+		if !strings.Contains(f, "/") {
+			continue
+		}
+		name := strings.TrimSpace(f[strings.LastIndex(f, "/")+1:])
+		if name != "" {
+			return name
 		}
 	}
 	return ""

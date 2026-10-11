@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -93,7 +94,15 @@ func (s *Server) handleDatabase(w http.ResponseWriter, r *http.Request) {
 		}
 		msg, err := s.Database.Test(in)
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			// 试连失败必须回非 2xx：以前回 200 + {"ok":false}，HTTP 层面看不出
+			// 失败 —— 通用包装/访问日志/重试逻辑都会把它当成功，口径也与
+			// monitor / files 的连接类失败不一致（那边是 502 Bad Gateway）。
+			//
+			// **原因仍留在 body 的 error 字段里**："保存前先试连、失败了要看到
+			// 原因"这个功能不受影响（前端的 req() 在非 2xx 时会读 error 字段
+			// 抛错，测试按钮把它显示成"测试失败：<原因>"）。
+			log.Printf("数据库试连失败: %v", err)
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
@@ -112,6 +121,10 @@ func (s *Server) handleDatabase(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, errText("请先选择一条连接"))
 			return
 		}
+		// max_rows 先按统一的一套常量夹一次（见 service.MaxQueryRows）：
+		// service 层还会按连接的配置上限再夹一次，两层都用同一组常量，
+		// 不会出现"某处写 5000、某处写 1000"这种对不上的口径。
+		in.MaxRows = service.ClampRequestedRows(in.MaxRows)
 		res, err := s.Database.Query(in.ConnID, in.SQL, in.MaxRows)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err)
@@ -146,9 +159,16 @@ func (s *Server) handleDatabase(w http.ResponseWriter, r *http.Request) {
 	// ---------- 图形化操作 ----------
 
 	case "rows":
+		// 一页的行数：默认值与上限都引用 service 里那套常量（不再写 100 这个字面量）。
+		// 越界就落回默认值 —— 与 dbx 里那条夹取（size<=0 或 >1000 → 100）同一口径，
+		// 所以这里夹一次不改变原来的实际行为。
+		size := atoiDefault(q.Get("size"), service.DefaultPageRows)
+		if size <= 0 || size > service.MaxPageRows {
+			size = service.DefaultPageRows
+		}
 		page, err := s.Database.Rows(q.Get("conn_id"), tableRef(q), dbx.RowQuery{
 			Page:    atoiDefault(q.Get("page"), 1),
-			Size:    atoiDefault(q.Get("size"), 100),
+			Size:    size,
 			OrderBy: q.Get("order"),
 			Desc:    q.Get("dir") == "desc",
 			Filter:  q.Get("filter"),

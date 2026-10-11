@@ -84,7 +84,7 @@
 
 ## 下载
 
-到 [Releases](https://github.com/guaidao2/awdshell/releases) 下载 `awdshell-windows-amd64-v1.0.1.zip`，解压后双击 `awdshell.exe`。
+到 [Releases](https://github.com/guaidao2/awdshell/releases) 下载 `awdshell-windows-amd64-v1.1.0.zip`，解压后双击 `awdshell.exe`。
 
 Windows 上依赖系统自带的 WebView2（Windows 11 与较新的 Windows 10 已预装）。
 

@@ -68,11 +68,24 @@ func Dial(host string, port int, auth Auth, timeout time.Duration) (*ssh.Client,
 		Timeout:         timeout,
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	client, err := ssh.Dial("tcp", addr, cfg)
+	// **不能只靠 ClientConfig.Timeout**：它只管 TCP 拨号那一段，握手读 banner
+	// 不受它约束 —— 对端接受 TCP 却永不发 banner 时 ssh.Dial 会一直等下去
+	//（审计实测：500ms 的超时 4 秒都不返回）。所以这里自己在 TCP 层设一次
+	// deadline 把整个握手圈住，握完立刻清掉。
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接 %s 失败: %w", addr, err)
 	}
-	return client, nil
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("连接 %s 失败: %w", addr, err)
+	}
+	// 握手完成后清掉 deadline（零值=不设限）：后续读写不能一直卡在这个超时上，
+	// 单次操作的超时由各自的 timeout 参数负责。
+	_ = conn.SetDeadline(time.Time{})
+	return ssh.NewClient(sshConn, chans, reqs), nil
 }
 
 // hostKeyCallback 造出校验主机密钥的回调（单独拎出来是为了能直接测 fail-closed）。

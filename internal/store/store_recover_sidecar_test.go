@@ -107,7 +107,7 @@ func TestOpenDetailNoteNamesMovedSHM(t *testing.T) {
 // 实测三种组合里只有一种会删（db+wal 有时删、db+shm 有时保留），端到端断言会
 // 变成看驱动脸色的 flaky 测试。所以把判据本身钉死：给定"打开前存在、没被我们
 // 移走、现在没了"，必须报出来；我们自己移走的、以及原本就不存在的，不能误报。
-func TestMissingSidecarsDetectsDriverDeletionOnly(t *testing.T) {
+func TestMissingSidecarPathsDetectsDriverDeletionOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "awdshell.db")
 
@@ -115,16 +115,23 @@ func TestMissingSidecarsDetectsDriverDeletionOnly(t *testing.T) {
 	if err := os.WriteFile(path+"-shm", []byte("s"), 0o600); err != nil {
 		t.Fatalf("造 -shm 失败: %v", err)
 	}
-	existed := sidecarExisted(path)
-	if len(existed) != 1 || existed[0] != "-shm" {
+	existed := sidecarSnapshot(path)
+	if len(existed) != 1 || existed[0].Path != path+"-shm" {
 		t.Fatalf("打开前的副文件快照不对: %v", existed)
+	}
+	if existed[0].Size == 0 {
+		t.Fatalf("快照必须带上当时的大小（空副文件被删不算丢数据）: %v", existed)
 	}
 	if err := os.Remove(path + "-shm"); err != nil {
 		t.Fatalf("模拟驱动删除失败: %v", err)
 	}
-	lost := missingSidecars(path, existed, nil)
+	lost := missingSidecarPaths(path, existed, nil)
 	if len(lost) != 1 || !strings.HasSuffix(lost[0], "-shm") {
 		t.Fatalf("驱动删掉的副文件没被认出来: %v", lost)
+	}
+	// 成功路径的判据同样要认（这份快照非空）
+	if got := discardedDataSidecarPaths(path, existed, nil); len(got) != 1 {
+		t.Fatalf("成功路径没认出被丢弃的非空副文件: %v", got)
 	}
 
 	// 我们自己移走的那份不算"被删"
@@ -135,13 +142,20 @@ func TestMissingSidecarsDetectsDriverDeletionOnly(t *testing.T) {
 	if err != nil || len(moved) != 1 {
 		t.Fatalf("移走 -wal 失败: moved=%v err=%v", moved, err)
 	}
-	if got := missingSidecars(path, []string{"-wal"}, moved); len(got) != 0 {
+	if got := missingSidecarPaths(path, []sidecarFile{{Path: path + "-wal", Size: 1}}, moved); len(got) != 0 {
 		t.Errorf("我们自己移走的文件被误报成驱动删除: %v", got)
 	}
 
 	// 打开前不存在的，现在也不存在 —— 不能报（否则每个正常库都"数据丢了"）
-	if got := missingSidecars(path, nil, nil); len(got) != 0 {
+	if got := missingSidecarPaths(path, nil, nil); len(got) != 0 {
 		t.Errorf("原本就没有的副文件被误报: %v", got)
+	}
+
+	// 成功路径的判据要放过 0 字节副文件：正常关闭的库旁边那份空 -wal 被驱动清掉
+	// 是常态，把它算成"丢了数据"会让每次正常启动都弹一次警告。
+	empty := []sidecarFile{{Path: path + "-empty-wal", Size: 0}}
+	if got := discardedDataSidecarPaths(path, empty, nil); len(got) != 0 {
+		t.Errorf("0 字节副文件被当成丢了数据: %v", got)
 	}
 }
 
@@ -223,10 +237,13 @@ func TestMoveSidecarsReturnsPathsEvenOnFailure(t *testing.T) {
 
 // 第二个实例打开同一份数据目录时，不能把第一个实例**正在跑**的会话标脏。
 //
-// 修复前 bootAt 在每次 Open 时刷新，于是 st2 的判据是"晚于 st2 打开的时刻"，
-// 而 st1 刚写入的那条 started_at 早于它 —— 实测标记 1 条，把活连接改成
-// ended_at=... + error="程序未正常退出"。修复后 bootAt 取本进程启动时刻，
-// 判据对同进程/跨进程的后来者一致成立，这条活连接不被标记。
+// 判据是 owner_pid：写记录时盖上本进程 pid，标记时先看那个 pid 还在不在。
+// 修复前只靠进程级 bootAt（甚至每次 Open 刷新的 bootAt），unset 掉 pid 判据后
+// 这条活连接会被标成"程序未正常退出"（实测跨进程：A pid 14836 活着，B pid 23192
+// 2 秒后打开就把 A 的会话标了 1 条）。
+//
+// 这里用 ownerAlive 注入模拟"那个进程还在/已经不在"：真去 kill 一个进程会让
+// 测试变成时序相关且不可重复。
 func TestSecondStoreDoesNotMarkLiveConnectionStale(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "shared.db")
@@ -252,12 +269,17 @@ func TestSecondStoreDoesNotMarkLiveConnectionStale(t *testing.T) {
 	}
 	defer st2.Close()
 
+	// 写记录的进程（本进程）还活着 —— 判据必须问出"活着"
+	origAlive := ownerAlive
+	ownerAlive = func(pid int) bool { return pid == os.Getpid() }
+	defer func() { ownerAlive = origAlive }()
+
 	n, err := st2.MarkStaleConnections("程序未正常退出")
 	if err != nil {
 		t.Fatalf("标记失败: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("正在跑的会话被标脏了：标记 %d 条（bootAt 又变回每次 Open 刷新了？）", n)
+		t.Fatalf("正在跑的会话被标脏了：标记 %d 条（owner_pid 判据丢了？）", n)
 	}
 
 	list, err := st1.ListConnections(10)
@@ -270,19 +292,32 @@ func TestSecondStoreDoesNotMarkLiveConnectionStale(t *testing.T) {
 		}
 	}
 
-	// 判据不能因此变成"谁也不标"：崩溃残留（started_at 早于本进程启动）照旧要标
-	oldID := liveID
-	if _, err := st2.db.Exec(
-		`UPDATE connections SET started_at = ? WHERE id = ?`,
-		time.Now().UnixMilli()-60_000, oldID); err != nil {
-		t.Fatalf("改 started_at 失败: %v", err)
+	// 判据不能因此变成"谁也不标"：写下记录的**另一个**进程已经没了，就是崩溃残留
+	if _, err := st2.db.Exec(`UPDATE connections SET owner_pid = 991999 WHERE id = ?`, liveID); err != nil {
+		t.Fatalf("改成别的进程写的失败: %v", err)
 	}
+	ownerAlive = func(pid int) bool { return pid == os.Getpid() }
 	n2, err := st2.MarkStaleConnections("程序未正常退出")
 	if err != nil {
 		t.Fatalf("标记失败: %v", err)
 	}
 	if n2 != 1 {
-		t.Fatalf("崩溃残留（早于进程启动）应当被标 1 条，实际 %d 条", n2)
+		t.Fatalf("进程已消失的残留会话应当被标 1 条，实际 %d 条", n2)
+	}
+
+	// 老库记录（owner_pid=0）走退回判据：本进程启动之前开始 + 晚于上次干净退出
+	ownerAlive = origAlive
+	if _, err := st2.db.Exec(`UPDATE connections SET ended_at = 0, exit_code = 0, error = '',
+		owner_pid = 0, started_at = ? WHERE id = ?`,
+		time.Now().UnixMilli()-60_000, liveID); err != nil {
+		t.Fatalf("改回老库形态失败: %v", err)
+	}
+	n3, err := st2.MarkStaleConnections("程序未正常退出")
+	if err != nil {
+		t.Fatalf("标记失败: %v", err)
+	}
+	if n3 != 1 {
+		t.Fatalf("老库的崩溃残留应当被标 1 条，实际 %d 条", n3)
 	}
 }
 
@@ -365,11 +400,16 @@ func TestHostKeyLegacySecondsAreMigrated(t *testing.T) {
 // （静默走掉的话，老库里的秒值永远修不好，用户看到的就是 1970-01-21）。
 //
 // 造法：把 known_hosts 换成一个只读视图（`WHERE 0` 没有行）。migrate 里那条
-// 「UPDATE known_hosts ...」打在上面必然失败：
-//   - 修复后：migrate 返回错误 → Open 失败，错误文本里带着"迁移主机密钥时间戳失败"；
-//   - 去掉那行调用：第二句根本不发，Open 照样成功 → 这条必红。
+// 「UPDATE known_hosts ...」打在上面必然失败。
 //
-// 视图列顺序与 SELECT * 一致，不会因为列错位误触发别的错。
+// **注意迁移现在是"先探有没有行要改、没有就跳过"**（审计 M3：每次启动无条件发
+// UPDATE 会让第二实例启动失败），所以探针必须能看见一行，否则这条 UPDATE 根本
+// 不发、Open 成功、测试假绿。这里用 SQLite 的**可写 CTE**给探针塞一行：
+// `WITH x(n) AS (VALUES(1)) SELECT 1 FROM x WHERE EXISTS(...)` —— 有 x 就一定有
+// 一行返回，EXISTS 的取值不再影响"探针有没有命中"。
+//   - 修复后：migrate 发 UPDATE → 打在只读视图上失败 → Open 失败，错误里带
+//     "迁移主机密钥时间戳失败"；
+//   - 把 migrate 里那句调用去掉：第二句根本不发，Open 照样成功 → 这条必红。
 func TestHostKeyMigrationIsWiredIntoMigrate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hostkey-migrate.db")
@@ -378,12 +418,18 @@ func TestHostKeyMigrationIsWiredIntoMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建库失败: %v", err)
 	}
+	// 先塞一行秒值（一定要有一行要改，否则新版 migrate 会跳过这条 UPDATE）
+	if _, err := st0.db.Exec(`INSERT INTO known_hosts(host,port,key_type,fingerprint,first_seen,last_seen)
+		VALUES('legacy.example',22,'k','fp',1791544791,1791544791)`); err != nil {
+		t.Fatalf("造老数据失败: %v", err)
+	}
 	if _, err := st0.db.Exec(`ALTER TABLE known_hosts RENAME TO known_hosts_real`); err != nil {
 		t.Fatalf("改名失败: %v", err)
 	}
+	// 视图是只读的：UPDATE 打上去必然失败（这是"迁移真的被执行了"的探针）
 	if _, err := st0.db.Exec(`CREATE VIEW known_hosts AS
 		SELECT host, port, key_type, fingerprint, first_seen, last_seen
-		FROM known_hosts_real WHERE 0`); err != nil {
+		FROM known_hosts_real`); err != nil {
 		t.Fatalf("建视图失败: %v", err)
 	}
 	_ = st0.Close()

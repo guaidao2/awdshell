@@ -79,7 +79,15 @@ type TargetService struct {
 	// `/api/db/query` 仍能对着已删目标走通。
 	onDelete []func(targetID string)
 
-	// muHooks 保护 onDelete：钩子在启动时注册、在删除目标时读取，
+	// onSave 是"已有目标被更新时"要跑的清理钩子（同样由 main 注入）。
+	//
+	// 为什么更新也要清（审计 H2）：Save 更新分支**保留原 ID**，所以目标从
+	// A 机改成 B 机之后，缓存里那份"上次采样的 CPU 时间片与网卡累计字节"
+	// 还是 A 机的。下次采样拿它做差，CPU% 与网速是假的，而且 First=false ——
+	// 界面按正常数值画出来，用户看不出这是错的。见 monitor.Forget。
+	onSave []func(targetID string)
+
+	// muHooks 保护 onDelete / onSave：钩子在启动时注册、在删除/保存目标时读取，
 	// 启动顺序之外基本不会并发，但注册表本身不该是一个裸字段。
 	muHooks sync.Mutex
 }
@@ -92,6 +100,47 @@ func (s *TargetService) AddOnDelete(fn func(string)) {
 	s.muHooks.Lock()
 	s.onDelete = append(s.onDelete, fn)
 	s.muHooks.Unlock()
+}
+
+// AddOnSave 追加一个"已有目标被更新时"的清理钩子（追加语义，同 AddOnDelete）。
+//
+// 只对"更新已有目标"触发，新建目标不触发：新建没有任何旧状态可清。
+func (s *TargetService) AddOnSave(fn func(string)) {
+	if fn == nil {
+		return
+	}
+	s.muHooks.Lock()
+	s.onSave = append(s.onSave, fn)
+	s.muHooks.Unlock()
+}
+
+// runSaveHooks 在"更新已有目标"落库之后跑清理钩子。
+func (s *TargetService) runSaveHooks(targetID string) {
+	s.muHooks.Lock()
+	hooks := append([]func(string){}, s.onSave...)
+	s.muHooks.Unlock()
+	for _, fn := range hooks {
+		fn(targetID)
+	}
+}
+
+// SaveHookCount 返回已注册的"更新目标"钩子数量。
+//
+// 为什么要有它：Save 的清理发生在**控制面之外**（main.go 把 monitor.Forget 挂上来），
+// 于是"接线漏了"这件事在任何直接调 TargetService 的测试里都看不出来 ——
+// 实测：把 main.go 里那行 AddOnSave 删掉，功能测试照样绿（审计 H2 就是这么漏的）。
+// main 包的启动自检用这个计数把它钉住。
+func (s *TargetService) SaveHookCount() int {
+	s.muHooks.Lock()
+	defer s.muHooks.Unlock()
+	return len(s.onSave)
+}
+
+// DeleteHookCount 同上，对应"删除目标"的钩子。
+func (s *TargetService) DeleteHookCount() int {
+	s.muHooks.Lock()
+	defer s.muHooks.Unlock()
+	return len(s.onDelete)
 }
 
 // SetOnDelete 注入"目标删除之后"的清理钩子（会**替换**已注册的全部钩子）。
@@ -167,6 +216,10 @@ func (s *TargetService) Save(in SaveTargetInput) (domain.Target, error) {
 			existing = t
 		}
 	}
+	// isUpdate：这次是"改已有目标"而不是"新建"。更新会把原 ID 留下来，
+	// 于是所有按 targetID 缓存的旧状态（监控采样基准、db 连接池）都成了
+	// 另一台机器的数据 —— 落库之后要清一次（见文件末尾的 runSaveHooks）。
+	isUpdate := existing.ID != ""
 	if in.ID == "" {
 		in.ID = newID()
 	}
@@ -228,7 +281,16 @@ func (s *TargetService) Save(in SaveTargetInput) (domain.Target, error) {
 		StartDir:  strings.TrimSpace(in.StartDir),
 		CreatedAt: existing.CreatedAt,
 	}
-	return s.store.SaveTarget(t)
+	saved, err := s.store.SaveTarget(t)
+	if err != nil {
+		return saved, err
+	}
+	// 更新已有的目标之后清一次缓存状态：主机/端口/用户名/凭据任何一项改了，
+	// "上一次采样"的数据就属于另一台机器了（Save 会保留原 ID，见上面的 existing）。
+	if isUpdate {
+		s.runSaveHooks(saved.ID)
+	}
+	return saved, nil
 }
 
 // Delete 删除目标。

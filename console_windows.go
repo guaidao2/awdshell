@@ -170,9 +170,21 @@ func attachParentConsole() {
 
 	_, _, _ = procAttachConsole.Call(attachParentProcess)
 
-	out, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0)
+	// 显式带上 O_CLOEXEC：句柄不参与子进程继承。
+	//
+	// 实测（Go 1.27）：os.OpenFile 内部已经加了它
+	//（$GOROOT/src/os/file_windows.go 的 openFileNolog：syscall.Open(path, flag|syscall.O_CLOEXEC, …)），
+	// 所以这里写不写都不改变行为 —— 但"这个句柄不可继承"是本文件要保证的语义，
+	// 挂在标准库的实现细节上太脆（以后换成 syscall.CreateFile 就直接丢掉）。
+	// 下面再用 SetHandleInformation 纠一次，把语义钉死。
+	out, err := os.OpenFile("CONOUT$", os.O_WRONLY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return // 真的没有控制台（双击启动）
+	}
+	if err := makeNonInheritable(syscall.Handle(out.Fd())); err != nil {
+		// 纠不回来也不能不接管控制台：这只是"子进程可能多拿到一个句柄"，
+		// 比"用户看不到任何输出"轻。
+		log.Printf("控制台句柄设为不可继承失败: %v", err)
 	}
 	setConsoleUTF8()
 
@@ -182,6 +194,44 @@ func attachParentConsole() {
 	}
 	os.Stderr = out
 	log.SetOutput(out)
+
+	// 句柄要活到进程退出（os.Stdout / os.Stderr / log 都挂在它上面），所以
+	// 存一份显式引用，并在收尾表里登记关闭：以前它没保存、也没关过，
+	// 只能靠 os.Stderr 的隐式可达性活着。登记的位置在这里 → 它在收尾表里
+	// 排最前、逆序执行时**最后**关，不会把后面那些收尾日志写丢。
+	consoleOutMu.Lock()
+	consoleOut = out
+	consoleOutMu.Unlock()
+	registerCleanup(closeConsoleOut)
+}
+
+// makeNonInheritable 清掉句柄的 HANDLE_FLAG_INHERIT 位（让子进程拿不到它）。
+func makeNonInheritable(h syscall.Handle) error {
+	if !handleValid(uintptr(h)) {
+		return nil
+	}
+	return syscall.SetHandleInformation(h, syscall.HANDLE_FLAG_INHERIT, 0)
+}
+
+// consoleOut 是"接管父控制台"时打开的 CONOUT$ 句柄。
+//
+// 为什么要保存它：它被挂到 os.Stdout / os.Stderr / log 的输出上，整个进程
+// 生命周期都在用（关闭只能发生在收尾路径上），显式存一份比"靠 os.Stderr
+// 恰好还引用着它"更清楚 —— 也让 closeConsoleOut 有东西可关。
+var (
+	consoleOutMu sync.Mutex
+	consoleOut   *os.File
+)
+
+// closeConsoleOut 关闭 CONOUT$ 句柄；可重复调用（没接管过就是空操作）。
+func closeConsoleOut() {
+	consoleOutMu.Lock()
+	defer consoleOutMu.Unlock()
+	if consoleOut == nil {
+		return
+	}
+	_ = consoleOut.Close()
+	consoleOut = nil
 }
 
 // restoreConsoleCP 把控制台输出代码页恢复成切换前的值。

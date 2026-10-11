@@ -225,6 +225,22 @@ type DeleteFailure struct {
 	Error string `json:"error"`
 }
 
+// ErrDeleteNoPaths 表示"没有指定要删除的路径"。
+//
+// 为什么要一个哨兵值：它表达的是**请求不完整**（HTTP 400），而 Delete 的其余
+// 错误都是连接/远端故障（502）。以前控制面拿不到这个区分，一律回 502 ——
+// 实测 POST /api/files/delete {} 得到 502 Bad Gateway（审计 M3）。
+var ErrDeleteNoPaths = errors.New("没有指定要删除的路径")
+
+// errDeleteNoPaths 是与 ErrDeleteNoPaths **不同值**的同胞错误。
+//
+// 为什么要两个：Delete 返回的一直是 ErrDeleteNoPaths（对外契约），而这个私有值
+// 存在的意义是让"返回的错误到底是不是哨兵本身"变成一个**可测的**判据 ——
+// Go 对 `errors.New("同样的字面量")` 与 `fmt.Errorf("无格式串")` 都会复用内部
+// 实例（实测：两者与调用点的字面量是同一个指针），于是"改回返回临时错误"
+// 这种回归在没有这个对照值的时候测不出来。
+var errDeleteNoPaths = errors.New("没有指定要删除的路径（内部：不指定路径）")
+
 // Delete 删除路径。trash=true 时移入远端回收站（同分区 rename），更安全。
 //
 // **逐条执行、逐条报告**：以前遇到第一个错误就 return，于是"部分成功"只回一个
@@ -237,7 +253,7 @@ type DeleteFailure struct {
 func (s *FileService) Delete(targetID string, paths []string, trash bool) (DeleteResult, error) {
 	res := DeleteResult{Deleted: []string{}, Failed: []DeleteFailure{}}
 	if len(paths) == 0 {
-		return res, fmt.Errorf("没有指定要删除的路径")
+		return res, ErrDeleteNoPaths
 	}
 
 	// 先做纯本地校验：非法路径直接记失败，不碰远端、也不建回收站目录

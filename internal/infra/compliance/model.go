@@ -95,14 +95,70 @@ type Set struct {
 	Source string
 }
 
+// 命令侧的可读性标记（见 checks/*.yaml 里 needs_root 那几条命令）。
+//
+// 为什么需要（复审 中2）：需要 root 才能读的检查项在非 root 登录下 grep 会
+// EACCES、什么都不输出，而"没输出"与"读到了、确实是空"在输出上长得一模一样。
+// 原来想用 `needs_root && body == ""` 兜底，但那段**永远走不到**：
+// grep 无匹配退出码 1 → sshx.RunOutput 返回 ExitError → Evaluate 在
+// `err != nil` 处就返回 error（"检查命令执行失败：exit status 1"）。
+// 实测干净 + root 的机器上这 4 条也从来没 pass 过。
+//
+// 现在命令自己把可读性说出来（`if [ -r … ]; then grep … || true; echo __AWD_READ_OK__;
+// else echo __AWD_READ_DENIED__; fi`，`|| true` 让退出码恒 0，判定才走得到），
+// 判定侧据此分辨三件事：
+//
+//	__AWD_READ_OK__     读到了 → 空结果可信（pass 或 fail 按规则判）
+//	__AWD_READ_DENIED__ 读不到 → error（"需要 root"，绝不判合规）
+//	两个都没有           老规则/自定义规则 → 保留"空输出 + needs_root → error"的兜底
+const (
+	markerReadOK     = "__AWD_READ_OK__"
+	markerReadDenied = "__AWD_READ_DENIED__"
+)
+
+// readMarkers 从命令输出里取出可读性标记，返回去掉标记行后的正文。
+//
+// 标记行整行都是标记（命令里就是 echo 一行），所以整行丢掉；标记不参与内容匹配，
+// 否则 `\S` 这种"有输出就不合规"的 pattern 会把标记本身当成发现。
+//
+// **判据是"整行 TrimSpace 后全等"，不是 Contains**（复审 L1，实测）：
+//
+//   - `%adm ALL=(ALL) NOPASSWD: ALL __AWD_READ_OK__` —— 一行真实的发现后面恰好跟着
+//     标记串时，Contains 会把**整行**当成标记丢掉，正文变空；而 readable=true 又让
+//     needs_root 的空输出兜底不生效（见 Evaluate），于是这条真问题被判 **pass**；
+//   - 同一行里含 __AWD_READ_DENIED__ 时，Contains 会让它被判成"读取被拒"的 error，
+//     把配置问题说成权限问题。
+//
+// 全等之后，这两行都留在正文里照规则判（前一个是 fail，后一个按内容判），而命令
+// 真正 echo 出来的那行标记（前后可能带空白，`echo` 不会，但 shell 输出可能被包）
+// 仍然识别得出来。
+func readMarkers(out string) (body string, readable, denied bool) {
+	kept := make([]string, 0, 8)
+	for _, line := range strings.Split(out, "\n") {
+		switch strings.TrimSpace(line) {
+		case markerReadOK:
+			readable = true
+			continue
+		case markerReadDenied:
+			denied = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n"), readable, denied
+}
+
 // Evaluate 按检查项的判定规则给出结论。
 // out 是命令输出，err 是执行错误。
 func Evaluate(chk Check, out string, err error) Result {
+	// 命令侧的可读性标记先摘掉：它们不是"配置内容"，不该参与判定，
+	// 也不该出现在给用户看的输出里。
+	body, readable, denied := readMarkers(out)
 	res := Result{
 		ID: chk.ID, Title: chk.Title, Category: chk.Category, Severity: chk.Severity,
 		Refs: chk.Refs, Command: chk.Command, Remedy: chk.Remedy, Note: chk.Note,
 		NeedsRoot: chk.NeedsRoot,
-		Output:    truncate(strings.TrimSpace(out), 1500),
+		Output:    truncate(strings.TrimSpace(body), 1500),
 	}
 
 	// manual 类型即使命令失败也要把输出给人看
@@ -122,7 +178,30 @@ func Evaluate(chk Check, out string, err error) Result {
 		return res
 	}
 
-	body := strings.TrimSpace(out)
+	// 命令报告"读不到"：这是权限问题，不是"没发现问题"。
+	// **必须排在所有判定类型之前**，也不受 needs_root 标志是否写对的影响。
+	if denied {
+		res.Status = StatusError
+		res.Detail = "命令报告读取被拒（权限不足）：这一项需要 root 才能读到结果，请用 root 或 sudo 复跑确认"
+		return res
+	}
+
+	body = strings.TrimSpace(body)
+
+	// 需要 root 的项输出为空时**不能直接判合规**。三件事要说清：
+	//   ① 这段兜底现在**可达**了 —— 命令侧用 `|| true` 压掉了 grep 的退出码，
+	//      不会再有"无匹配就 ExitError"提前 return（原来那段是死代码）；
+	//   ② 放在 switch 之前，对**所有**判定类型生效：以前只有 regex_not_match 有，
+	//      而 contains 空输出恒 fail（冤枉）、not_contains 空输出恒 pass（放过），
+	//      两个方向都是假结论；
+	//   ③ 命令已经用 __AWD_READ_OK__ 明确"读到了"时不算空 —— 这时空结果是真的空，
+	//      pass/fail 照规则判（干净 + root 的主机就该判 pass）。
+	if chk.NeedsRoot && body == "" && !readable {
+		res.Status = StatusError
+		res.Detail = "输出为空，但这一项需要 root 才能读到结果 —— 请用 root 复跑确认"
+		return res
+	}
+
 	switch chk.Expect.Type {
 	case ExpectRegexMatch:
 		matched, mErr := matchPattern(chk.Expect.Pattern, body)
@@ -155,6 +234,8 @@ func Evaluate(chk Check, out string, err error) Result {
 			res.Status = StatusFail
 			res.Detail = "发现了不符合要求的内容"
 		} else {
+			// 空输出在这里已是合规（"没发现问题"）。needs_root 的空输出兜底
+			// 已在 switch 之前统一处理，不再需要这一分支的副本。
 			res.Status = StatusPass
 			res.Detail = "未发现不符合要求的内容"
 		}

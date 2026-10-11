@@ -16,6 +16,63 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// 结果集体积上限的**唯一一套**常量。
+//
+// 以前 5000 / 500 / 1000 / 100 这几个数散在四处各写各的（保存连接、执行查询、
+// HTTP 入参、分页浏览），改一处忘了另一处就会出现"配置里能填 5000、实际只给 500"
+// 这类对不上的口径。所有夹取点都必须引用这里的名字，不要再写字面量。
+const (
+	// MaxQueryRows 是单次 SQL 查询最多返回的行数（连接配置里的上限也受它约束）。
+	// 前端 max_rows 输入框的 max 与它一致。
+	MaxQueryRows = 5000
+	// DefaultQueryRows 是连接配置没给上限（或给成了非法值）时的默认行数。
+	DefaultQueryRows = 500
+
+	// MaxPageRows 是图形化分页浏览一页最多返回的行数。
+	// 与 MaxQueryRows 是两个口径：分页是"翻着看"，查询是"取一批结果"，
+	// 所以分页的上限小得多。
+	MaxPageRows = 1000
+	// DefaultPageRows 是分页浏览一页的默认行数（前端下拉的默认值也是它）。
+	DefaultPageRows = 100
+)
+
+// clampQueryRows 把连接配置里的行数上限夹进允许区间。
+func clampQueryRows(n int) int {
+	if n <= 0 || n > MaxQueryRows {
+		return DefaultQueryRows
+	}
+	return n
+}
+
+// clampMaxRowsToConn 把请求要的行数夹到"这条连接配置的上限"之内。
+//
+// 抽成纯函数是为了能直接单测（Query 那条路要真数据库连接）：
+// 客户端传的值只能**收小**、不能放大连接配置里的上限。
+// 配置上限本身先过一遍统一的那套夹取（它理论上已经被 SaveConn 夹过，
+// 但旧库里的坏数据不能让这里算出 >MaxQueryRows 的量）—— 0 尤其危险，
+// 驱动会把 0 当"不限"，等于把整表读进内存。
+func clampMaxRowsToConn(requested, connLimit int) int {
+	connLimit = clampQueryRows(connLimit)
+	if requested <= 0 || requested > connLimit {
+		requested = connLimit
+	}
+	return requested
+}
+
+// ClampRequestedRows 夹取 HTTP 入参里的 max_rows。
+//
+// 0（或负数、缺省）表示"按连接配置来"，最终值由 Query 决定；
+// 超过 MaxQueryRows 的请求值直接压到上限，不让它进到下游去放大。
+func ClampRequestedRows(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > MaxQueryRows {
+		return MaxQueryRows
+	}
+	return n
+}
+
 // DatabaseService 通过目标机已有的 SSH 连接管理数据库。
 //
 // 数据库一般只监听 127.0.0.1，所以这里不直连，而是用 SSH 连接自己拨号过去；
@@ -103,9 +160,9 @@ func (s *DatabaseService) SaveConn(in DBConnInput) (store.DBConn, error) {
 	if in.ReadOnly != nil {
 		c.ReadOnly = *in.ReadOnly
 	}
-	if c.MaxRows <= 0 || c.MaxRows > 5000 {
-		c.MaxRows = 500
-	}
+	// 上限夹取走统一的那一套（见 MaxQueryRows / DefaultQueryRows）：
+	// 以前这里写死 5000/500，与执行查询、HTTP 入参、分页浏览的口径各写各的。
+	c.MaxRows = clampQueryRows(c.MaxRows)
 
 	// 目标名冗余存一份，列表不用再联表
 	if t, _, err := s.targets.Auth(c.TargetID); err == nil {
@@ -387,13 +444,14 @@ func (s *DatabaseService) Query(id, sqlText string, maxRows int) (*dbx.Result, e
 	if err != nil {
 		return nil, err
 	}
-	if c.ReadOnly && !dbx.IsReadOnlySQL(sqlText) {
+	// 按连接的**方言**判只读：`\'` 在 MySQL 默认 sql_mode 下是字面量里的转义引号，
+	// 一律按"有分隔符"判会把 `SELECT 'it\'s'` 这种普通查询误判成写（只读连接被拒、
+	// 非只读连接走 Exec 把结果集丢掉）。PG 那边反过来没有反斜杠转义，保守判才安全。
+	if c.ReadOnly && !dbx.IsReadOnlySQLFor(sqlText, c.Kind) {
 		return nil, fmt.Errorf("这条连接是只读模式，只允许查询类语句（SELECT / SHOW / EXPLAIN 等）。要执行写操作，请在编辑连接时取消「只读」")
 	}
-	if maxRows <= 0 || maxRows > c.MaxRows {
-		// 客户端传的值不能放大连接配置里的上限
-		maxRows = c.MaxRows
-	}
+	// 客户端传的值不能放大连接配置里的上限（夹取的口径见 clampMaxRowsToConn）
+	maxRows = clampMaxRowsToConn(maxRows, c.MaxRows)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

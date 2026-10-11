@@ -613,7 +613,25 @@ func mkTempDir(t *testing.T, prefix string) string {
 	if err != nil {
 		t.Fatalf("创建临时目录失败: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	// 清理必须重试，而且失败要说话。
+	//
+	// Windows 上 store.Close() 返回后 SQLite 的 -wal / -shm 句柄未必立刻释放，
+	// RemoveAll 会报 "being used by another process"。以前这里是
+	// `_ = os.RemoveAll(dir)` —— 失败静默，测试跑完在工作区里留下一堆
+	// .test-grace2-* 目录（实测累积过 23 个）。重试之间顺手清掉可能被 SQLite
+	// 重建的 WAL/SHM，仍然失败就 t.Logf 出来，让工作区不洁这件事可见。
+	t.Cleanup(func() {
+		var lastErr error
+		for i := 0; i < 10; i++ {
+			if lastErr = os.RemoveAll(dir); lastErr == nil {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+			_ = os.Remove(filepath.Join(dir, "t.db-wal"))
+			_ = os.Remove(filepath.Join(dir, "t.db-shm"))
+		}
+		t.Logf("清理临时目录失败（%s）：%v —— 请手动删除 %s", prefix, lastErr, dir)
+	})
 	return dir
 }
 

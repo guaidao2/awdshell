@@ -290,10 +290,60 @@ var stmtRe = regexp.MustCompile(`(?is)^(select|insert|update|delete|merge|trunca
 //
 // 处理规则：普通注释与行注释丢弃，可执行注释保留内容（去掉 /*! 与版本号），
 // 连续空白压成一个空格。整体 O(n)，不做反复扫描。
+//
+// **引号状态机是必须的**：字符串字面量与反引号标识符里的 `#`、`-- `、`/*`
+// 都不是注释。以前这里只按字面找标记，于是
+// `SELECT '#x' INTO OUTFILE '/tmp/x'` 里的 `#` 被当成行注释，把后半条语句
+// 连同真正的写操作整段吞掉，压平后只剩 `SELECT '` —— IsReadOnlySQL 判成
+// **只读**，只读连接下把它放行到落文件（审计实测）。同文件的
+// hasStatementSeparator / quoteAwareWords 都在跳引号，这里是唯一漏掉的。
 func flattenSQL(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
+	var quote byte // 非 0 表示正处在 ' / " / ` 里面
 	for i := 0; i < len(s); {
+		c := s[i]
+
+		if quote != 0 {
+			b.WriteByte(c)
+			if c == '\\' && quote != '`' {
+				// MySQL 的反斜杠转义：下一个字节也属于这个字面量，
+				// 不能让它被当成引号结束。
+				if i+1 < len(s) {
+					b.WriteByte(s[i+1])
+					i += 2
+					continue
+				}
+			} else if c == quote {
+				// 两个连写的引号代表一个引号本身（SQL 标准）
+				if i+1 < len(s) && s[i+1] == quote {
+					b.WriteByte(s[i+1])
+					i += 2
+					continue
+				}
+				quote = 0
+			}
+			i++
+			continue
+		}
+
+		switch c {
+		case '\'', '"', '`':
+			quote = c
+			b.WriteByte(c)
+			i++
+			continue
+		case '#':
+			// 到行尾的注释（MySQL/MariaDB）
+			if j := strings.IndexByte(s[i:], '\n'); j >= 0 {
+				i += j + 1
+				b.WriteByte(' ')
+				continue
+			}
+			i = len(s)
+			continue
+		}
+
 		if strings.HasPrefix(s[i:], "/*") {
 			executable := strings.HasPrefix(s[i:], "/*!")
 			end := strings.Index(s[i+2:], "*/")
@@ -314,27 +364,19 @@ func flattenSQL(s string) string {
 			i += 2 + end + 2
 			continue
 		}
-		// 行注释：`--` 后必须跟空白（或到行尾）才算注释，避免误伤 a--b；
-		// `#` 在 MySQL/MariaDB 里也是到行尾的注释。
-		lineComment := false
+		// 行注释：`--` 后必须跟空白（或到行尾）才算注释，避免误伤 a--b
 		if strings.HasPrefix(s[i:], "--") {
 			rest := s[i+2:]
 			if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' || rest[0] == '\r' {
-				lineComment = true
+				if j := strings.IndexByte(s[i:], '\n'); j >= 0 {
+					i += j + 1
+					// **必须补一个空格**：不补的话 `INTO--\nOUTFILE` 会被粘成
+					// `intooutfile`，后面判 `into outfile` 就落空。
+					b.WriteByte(' ')
+					continue
+				}
+				break
 			}
-		} else if s[i] == '#' {
-			lineComment = true
-		}
-		if lineComment {
-			if j := strings.IndexByte(s[i:], '\n'); j >= 0 {
-				i += j + 1
-				// **必须补一个空格**：不补的话 `INTO--\nOUTFILE` 会被粘成
-				// `intooutfile`，后面判 `into outfile` 就落空 ——
-				// 实测只读判据因此返回 true，只读连接下把语句放行到落文件。
-				b.WriteByte(' ')
-				continue
-			}
-			break
 		}
 		b.WriteByte(s[i])
 		i++
@@ -342,25 +384,48 @@ func flattenSQL(s string) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
-// hasStatementSeparator 判断有没有"真正在语句之间的"分号。
+// hasStatementSeparator 判断有没有"真正在语句之间的"分号（**方言不明**的口径）。
 //
 // 字符串字面量（'...' / "..."）与反引号标识符里的分号不算 —— `SELECT 'a;b'`
 // 是一条普通查询，以前被当成多语句后走 ExecContext，结果集被静默丢掉，
 // 界面显示"无结果 / 影响 0 行"。注释在 flattenSQL 里已经处理掉了。
+//
+// 方言不明时按最保守的方向：把 `\` 当普通字符（见 hasStatementSeparatorIn）。
 func hasStatementSeparator(sqlText string) bool {
+	return hasStatementSeparatorIn(sqlText, false)
+}
+
+// hasStatementSeparatorIn 是带方言参数的实现。
+//
+// backslashEscapes 为真表示"这个方言里 `\` 是字符串字面量内的转义符"
+// （MySQL / MariaDB 默认 sql_mode；不含 NO_BACKSLASH_ESCAPES）。
+//
+// **为什么必须分方言**（复审 高1）：MySQL 里 `SELECT 'it\'s' AS c` 与
+// `WHERE name='O\'Brien'` 都是最普通的写法，而"`\` 后面跟引号 → 判有分隔符"
+// 的保守口径把它们判成**写**，两条后果都很实在：
+//   - 只读连接上直接被拒（"只允许查询类语句"）；
+//   - 非只读连接上走 ExecContext，**SELECT 的结果集被静默丢掉**，
+//     界面显示"影响 0 行" —— 正是这一轮要消灭的那类静默丢结果。
+//
+// 反过来，PG / SQLite 里 `\` 是普通字符，`SELECT 'a\';DROP TABLE t` 真的是
+// **两条语句**；按 MySQL 口径跳过后整串会被当成"未闭合的字符串"，判成只读 →
+// 走 QueryContext、多语句闸门形同不存在。所以：
+//
+//	MySQL  → backslashEscapes = true（按转义语义）
+//	其余/未知 → false（宁可判"有分隔符"拒只读，也不漏）
+func hasStatementSeparatorIn(sqlText string, backslashEscapes bool) bool {
 	var quote byte
 	for i := 0; i < len(sqlText); i++ {
 		c := sqlText[i]
 		if quote != 0 {
-			// 反斜杠转义**只对 MySQL 成立**（且 sql_mode 不含 NO_BACKSLASH_ESCAPES）。
-			// PG / SQLite 里 `\` 是普通字符，`SELECT 'a\';DROP TABLE t` 就是
-			// **两条语句** —— 以前这里一律跳过后，整串被当成"未闭合的字符串"，
-			// 判成只读 → 走 QueryContext、多语句闸门形同不存在。
-			// 方言不明时宁可判"有分隔符"（拒只读），不要漏。
 			if c == '\\' && quote != '`' {
-				if i+1 < len(sqlText) && sqlText[i+1] == quote {
+				if !backslashEscapes && i+1 < len(sqlText) && sqlText[i+1] == quote {
+					// 非 MySQL：`\` 不转义，这个引号就是字面量的结尾，
+					// 后面紧跟的东西有可能已经是新语句的一部分 —— 保守拒只读。
 					return true
 				}
+				// 跳过被转义（或本方言里无特殊含义）的那一个字节：
+				// MySQL 下必须跳，否则 `\'` 里的引号会被当成字面量结尾。
 				i++
 				continue
 			}
@@ -421,13 +486,48 @@ func containsWord(s, w string) bool {
 	return false
 }
 
+// containsWordTriple 判断三个单词是否**按顺序相邻**出现（中间只隔空白）。
+// 用来认 `NEXT VALUE FOR myseq` 这种词组形态的副作用（它不是函数调用形态，
+// 没有括号，containsWord 那种逐词判据认不出"这三个词连在一起"）。
+func containsWordTriple(s, a, b, c string) bool {
+	f := strings.Fields(s)
+	for i := 0; i+2 < len(f); i++ {
+		if f[i] == a && f[i+1] == b && f[i+2] == c {
+			return true
+		}
+	}
+	return false
+}
+
+// trimTrailingSemicolons 削掉尾部连续的 `;` 与空白。
+//
+// 为什么要抽成一个函数（审计 第 10 条）：只读判定与真正发出去的语句必须
+// **用同一套口径**。以前判定侧用 TrimRight(s, "; ")（削掉全部尾部分号）、
+// 发送侧用 TrimSuffix(s, ";")（只削一个），于是 `SELECT 1;;` 被判成只读，
+// 却把 `SELECT 1;;` 原样发给 MySQL —— 语法错。
+// 注：只处理**尾部**，语句中间的分号是 hasStatementSeparator 的事（它跳引号）。
+func trimTrailingSemicolons(s string) string {
+	for {
+		t := strings.TrimRight(s, " \t\r\n")
+		if !strings.HasSuffix(t, ";") {
+			return t
+		}
+		s = t[:len(t)-1]
+	}
+}
+
 // selectIntoTable 判断是否存在 `into <标识符>` 形态
 // （PG 的 CREATE TABLE AS、MySQL 的变量赋值）。outfile/dumpfile 由调用方单独处理。
 //
 // words 是压平后的文本：`@a` 里的 `@` 已被抹成空格，所以 `SELECT 1 INTO @a`
 // 会变成 `... into a`，这里也能命中。
 func selectIntoTable(sqlText string) bool {
-	f := quoteAwareWords(sqlText)
+	return selectIntoTableIn(sqlText, false)
+}
+
+// selectIntoTableIn 是带方言参数的版本（反斜杠转义见 quoteAwareWordsIn）。
+func selectIntoTableIn(sqlText string, backslashEscapes bool) bool {
+	f := quoteAwareWordsIn(sqlText, backslashEscapes)
 	for i := 0; i+1 < len(f); i++ {
 		if f[i] != "into" {
 			continue
@@ -444,7 +544,22 @@ func selectIntoTable(sqlText string) bool {
 // quoteAwareWords 按"SQL 词"切分，但**跳过字符串字面量与反引号标识符内部** ——
 // 那里的内容不是关键字（`SELECT 'into outfile' AS note` 是普通查询）。
 // 标点一律当分隔符，所以 `INTO/**/OUTFILE` 这类也能切开。
+//
+// 保守默认：`\` 不当转义（见 quoteAwareWordsIn）。
 func quoteAwareWords(s string) []string {
+	return quoteAwareWordsIn(s, false)
+}
+
+// quoteAwareWordsIn 带方言参数：backslashEscapes 为真时 `\'` 是**字面量里的引号**，
+// 不是字面量的结尾。
+//
+// 为什么这里也必须分方言（复审 高1 的同一条）：MySQL 下
+// `SELECT 'a\'b' INTO OUTFILE '/tmp/x'` 的字面量是 `a'b`，后面那句 INTO OUTFILE
+// 是真的写操作。本函数以前不认反斜杠，于是把 `\'` 当成字面量结尾，后面的内容被
+// 切成一堆碎片 —— 分词结果里再也凑不出 `into outfile`，这条**会落文件的语句
+// 反而被判成只读**。以前它"看起来是对的"只是因为 hasStatementSeparator 那条
+// 过宽的判据替它兜住了（一律判写），而那条判据正是高1 要修的。
+func quoteAwareWordsIn(s string, backslashEscapes bool) []string {
 	var out []string
 	var b strings.Builder
 	var quote byte
@@ -457,6 +572,10 @@ func quoteAwareWords(s string) []string {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if quote != 0 {
+			if c == '\\' && quote != '`' && backslashEscapes {
+				i++ // 跳过被转义的字节（`\'` 不是字面量结尾）
+				continue
+			}
 			if c == quote {
 				if i+1 < len(s) && s[i+1] == quote {
 					i++
@@ -482,11 +601,32 @@ func quoteAwareWords(s string) []string {
 	return out
 }
 
-// IsReadOnlySQL 判断一条语句是不是只读的（查询类）。
+// IsReadOnlySQL 判断一条语句是不是只读的（查询类），**方言不明**的口径。
 //
 // 用来决定走 Query 还是 Exec，也用来提前给出"只读模式"的友好提示。
 // 注意它**不是**安全边界，安全边界在数据库那边。
+//
+// 方言不明的口径是保守的那一侧：`\` 当普通字符 —— 于是 MySQL 的
+// `SELECT 'it\'s'` 会被判成写。**调用方知道方言时必须用 IsReadOnlySQLFor**，
+// 否则 MySQL 连接上最普通的转义引号写法要么被只读模式拒掉，
+// 要么在非只读连接上被判成写、走 ExecContext 把结果集静默丢掉。
+// 保留这个签名只为不惊动既有调用方（签名一变就要连带动 service）。
 func IsReadOnlySQL(sqlText string) bool {
+	return isReadOnlySQL(sqlText, "")
+}
+
+// IsReadOnlySQLFor 按**连接方言**判断一条语句是不是只读的。
+//
+// kind 取 KindMySQL / KindPostgres（空串或未知 = 按最保守口径，等价于
+// IsReadOnlySQL）。Conn.Query 内部用的就是这个函数，调用方（service）在
+// "只读模式"的前置校验里也应当用它，两处口径才会一致。
+func IsReadOnlySQLFor(sqlText, kind string) bool {
+	return isReadOnlySQL(sqlText, kind)
+}
+
+func isReadOnlySQL(sqlText, kind string) bool {
+	// 反斜杠是否转义**只看方言**：MySQL/MariaDB 是转义符，PG 不是。
+	backslashEscapes := kind == KindMySQL
 	// 先压平，再判。**不能用"剥掉前导注释"的办法**：MySQL 的 `/*!...*/`、
 	// `/*!50000 ... */` 是**可执行注释**，服务端会把里面的内容展开执行，而
 	// 老实现无条件把它当注释剥掉，于是 `/*!50000 DROP TABLE t */ SELECT 1`
@@ -513,40 +653,63 @@ func IsReadOnlySQL(sqlText string) bool {
 	// 但先去尾分号 —— `SELECT 1;` 是最普通的写法，一刀切会把只读连接上
 	// 正常的查询挡掉（Conn.Query 里已经这么处理了，这道闸门要对齐）。
 	//
+	// **两处口径必须一模一样**（审计 第 10 条）：这里原来是 TrimRight(flat, "; ")，
+	// 把**所有**尾部分号都削掉，于是 `SELECT 1;;` 被判成只读；而 Conn.Query 只
+	// TrimSuffix 一次，真正发给数据库的还是 `SELECT 1;;` —— MySQL 下那是语法错。
+	// 现在两边都走 trimTrailingSemicolons，判"只读"与"发什么"永远一致。
+	//
 	// **分号要跳过引号里的**：`SELECT 'a;b'` 的分号在字符串字面量内，不是多语句 ——
 	// 以前判成写之后走 ExecContext，**SELECT 的结果集被静默丢掉**，
-	// 界面显示"无结果 / 影响 0 行"。
-	if hasStatementSeparator(strings.TrimRight(flat, "; ")) {
+	// 界面显示"无结果 / 影响 0 行"。那是 hasStatementSeparator 自己的事，
+	// 它跳引号；这里只负责"尾部多出来的分号"。
+	if hasStatementSeparatorIn(trimTrailingSemicolons(flat), backslashEscapes) {
 		return false
 	}
 	// 这两类会在目标机落文件。**按单词序列判**，不按子串：
 	// 把非字母数字一律压成空格之后，任何符号切分（`INTO/**/OUTFILE`、
 	// `INTO--\nOUTFILE`、`INTO#\nOUTFILE`、`INTO\tOUTFILE`）都不再有效，
 	// 而 `xinto outfile` 这种粘词也不会误命中。
-	// 用 quoteAwareWords（**跳过字符串字面量里的内容**）而不是压平后的 wordsOnly：
+	// 用 quoteAwareWordsIn（**跳过字符串字面量里的内容**）而不是压平后的 wordsOnly：
 	// `SELECT 'into outfile' AS note` 是普通查询，压平会把引号抹成空格，
 	// 于是它被误判成写 —— 只读模式下把合法查询挡掉、非只读模式下结果集被丢。
-	qw := strings.Join(quoteAwareWords(flat), " ")
+	// 分词也必须按方言转义，否则 MySQL 的 `SELECT 'a\'b' INTO OUTFILE '/tmp/x'`
+	// 会在这里被切碎、凑不出 into outfile（见 quoteAwareWordsIn）。
+	qw := strings.Join(quoteAwareWordsIn(flat, backslashEscapes), " ")
 	if containsWordPair(qw, "into", "outfile") || containsWordPair(qw, "into", "dumpfile") {
 		return false
 	}
 	// `SELECT ... INTO <标识符>`：PG 里就是 CREATE TABLE AS（建表），
 	// MySQL 里是变量赋值（`SELECT 1 INTO @a`）。outfile/dumpfile 上面已单独判过。
-	if selectIntoTable(flat) {
+	if selectIntoTableIn(flat, backslashEscapes) {
 		return false
 	}
 	// 会产生**副作用**的函数：只读模式下不该放行。
 	// 服务端只读事务能兜住 SELECT INTO / nextval / setval，兜不住
 	// pg_terminate_backend 这类"函数动作"（照样能断掉别人的连接）。
+	//
+	// 审计实测放行的五个（第 9 条），逐个补进来：
+	//   SELECT NEXT VALUE FOR myseq      —— 序列推进（SQL 标准写法，
+	//                                       不在 nextval 那条判据的覆盖里）
+	//   set_config('default_transaction_read_only','off',false) —— 直接把
+	//                                       只读会话改成可写（最坏的一个）
+	//   lo_put / pg_stat_reset / pg_switch_wal —— 写大对象、清统计、切 WAL
 	for _, fn := range []string{
 		"pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile",
-		"lo_export", "lo_import", "lo_unlink", "dblink_exec",
+		"lo_export", "lo_import", "lo_unlink", "lo_put", "dblink_exec",
 		"pg_read_file", "pg_read_binary_file", "pg_ls_dir",
 		"setval", "nextval", "pg_sleep",
+		"set_config", "pg_stat_reset", "pg_stat_reset_shared", "pg_stat_reset_single_table_counters",
+		"pg_switch_wal", "pg_create_restore_point",
+		"pg_logical_emit_message", "pg_replication_origin_advance",
 	} {
 		if containsWord(qw, fn) {
 			return false
 		}
+	}
+	// `NEXT VALUE FOR <seq>`：三个词，且中间可能夹注释被压平成空白。
+	// 上面那张表只能按单词判，这个词组要单独认（不是函数调用形态，没有括号）。
+	if containsWordTriple(qw, "next", "value", "for") {
+		return false
 	}
 	// EXPLAIN 要看它解释的是什么语句：
 	// 带 ANALYZE / ANALYSE 时数据库会**真的执行**被解释的语句，所以
@@ -630,7 +793,9 @@ func IsReadOnlySQL(sqlText string) bool {
 		}
 		if executes {
 			// 带 ANALYZE：数据库会真的执行被解释的语句，按语句本身判
-			return IsReadOnlySQL(rest)
+			// （方言要一路带下去，否则 MySQL 的 `EXPLAIN ANALYZE SELECT 'it\'s'`
+			// 又会被保守口径判成写）
+			return isReadOnlySQL(rest, kind)
 		}
 		// 不带 ANALYZE：理论上只出计划。但"解释的是什么"必须认得出——
 		// 不能因为不认识某个修饰语就假定它不执行（那是个假判据）。
@@ -643,10 +808,19 @@ func IsReadOnlySQL(sqlText string) bool {
 	// WITH 可能是纯查询（WITH x AS (SELECT ...) SELECT ...），
 	// 也可能是数据修改 CTE（PG：WITH d AS (DELETE ... RETURNING *) SELECT * FROM d；
 	// MySQL 8：WITH ... DELETE/UPDATE），所以要看整体有没有写操作关键字。
+	//
 	// 用 flat：可执行注释里的关键字也算数。
+	//
+	// **判词必须引号感知**（审计 第 8 条）：以前是 strings.Contains，
+	// 字符串字面量里的 'delete' / 'update' 也算命中 ——
+	// `WITH t AS (SELECT 'delete' AS a) SELECT * FROM t` 被判成写，
+	// 只读连接上直接被拒、非只读连接上走 ExecContext，**结果集被静默丢掉**
+	//（界面显示"无结果 / 影响 0 行"）。同一函数里的 into outfile / 副作用函数
+	// 全都在用 quoteAwareWords，这里没有理由例外。
 	if strings.HasPrefix(flat, "with") {
+		withWords := strings.Join(quoteAwareWordsIn(flat, backslashEscapes), " ")
 		for _, w := range []string{"insert", "update", "delete", "merge", "truncate"} {
-			if strings.Contains(flat, w) {
+			if containsWord(withWords, w) {
 				return false
 			}
 		}
@@ -661,8 +835,10 @@ func (c *Conn) Query(ctx context.Context, sqlText string, maxRows int) (*Result,
 		return nil, fmt.Errorf("连接未建立")
 	}
 	sqlText = strings.TrimSpace(sqlText)
-	// 去掉结尾分号：部分驱动对 "select 1;" 配 ExecContext 会报错
-	sqlText = strings.TrimSpace(strings.TrimSuffix(sqlText, ";"))
+	// 去掉结尾分号：部分驱动对 "select 1;" 配 ExecContext 会报错。
+	// **与 IsReadOnlySQLFor 用同一个函数**（审计 第 10 条）：两边口径不一致时，
+	// `SELECT 1;;` 会被判成只读、却把 `SELECT 1;;`（两个分号）发给 MySQL 报语法错。
+	sqlText = trimTrailingSemicolons(sqlText)
 	if sqlText == "" {
 		return nil, fmt.Errorf("SQL 是空的")
 	}
@@ -671,7 +847,9 @@ func (c *Conn) Query(ctx context.Context, sqlText string, maxRows int) (*Result,
 	}
 
 	res := &Result{Statement: sqlText, Columns: []string{}, Rows: [][]string{}}
-	res.ReadOnly = IsReadOnlySQL(sqlText)
+	// **按连接方言判**：MySQL 的 `SELECT 'it\'s'` 是普通查询，判成写就会走
+	// ExecContext 把结果集静默丢掉（界面显示"影响 0 行"）。
+	res.ReadOnly = IsReadOnlySQLFor(sqlText, c.kind)
 	started := time.Now()
 	defer func() { res.ElapsedMs = time.Since(started).Milliseconds() }()
 

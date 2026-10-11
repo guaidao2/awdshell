@@ -44,22 +44,12 @@ func LoadSets() ([]Set, []string, error) {
 		}
 		valid := make([]Check, 0, len(d.Checks))
 		for _, c := range d.Checks {
-			if strings.TrimSpace(c.ID) == "" || strings.TrimSpace(c.Title) == "" || strings.TrimSpace(c.Command) == "" {
-				problems = append(problems, fmt.Sprintf("%s: 有检查项缺少 id / title / command，已跳过", name))
+			if why := validateCheck(c); why != "" {
+				problems = append(problems, fmt.Sprintf("%s: %s", name, why))
 				continue
 			}
 			if c.Expect.Type == "" {
 				c.Expect.Type = ExpectManual
-			}
-			// 正则类检查项在**加载时**就编译一次：写错了要当场记进 problems 并跳过。
-			// 否则要到运行期才发现，而 regex_not_match 的失败方向是"判成合规"
-			//（fail-open）—— 该报不合规的报成合规，比直接报错危险得多。
-			if c.Expect.Type == ExpectRegexMatch || c.Expect.Type == ExpectRegexNotMatch {
-				if _, err := compiled(strings.TrimSpace(c.Expect.Pattern)); err != nil {
-					problems = append(problems,
-						fmt.Sprintf("%s: 检查项 %s 的正则无法编译（%v），已跳过", name, c.ID, err))
-					continue
-				}
 			}
 			if c.Timeout <= 0 {
 				c.Timeout = 10
@@ -72,6 +62,40 @@ func LoadSets() ([]Set, []string, error) {
 		sets = append(sets, Set{Meta: d.Meta, Checks: valid, Source: name})
 	}
 	return sets, problems, nil
+}
+
+// validateCheck 校验一条检查项，返回空串表示通过、否则是"为什么跳过"。
+//
+// 单独抽出来是为了能直接测这些判据（LoadSets 只读 embed，测不到手写的坏 YAML）。
+// 两类必须拦住的写法：
+//   - 正则无法编译：regex_not_match 的失败方向是"判成合规"（fail-open），
+//     该报不合规的报成合规，比直接报错危险得多；
+//   - **pattern 为空**：空正则/空串能匹配任何东西 —— regex_match、contains 恒 pass，
+//     regex_not_match、not_contains 恒 fail，而且都不会报错。规则文件是外部可编辑的，
+//     不能靠"当前 67 条都没写错"。
+func validateCheck(c Check) string {
+	if strings.TrimSpace(c.ID) == "" || strings.TrimSpace(c.Title) == "" || strings.TrimSpace(c.Command) == "" {
+		return "有检查项缺少 id / title / command，已跳过"
+	}
+	typ := c.Expect.Type
+	if typ == "" {
+		typ = ExpectManual
+	}
+	pattern := strings.TrimSpace(c.Expect.Pattern)
+	switch typ {
+	case ExpectRegexMatch, ExpectRegexNotMatch:
+		if pattern == "" {
+			return fmt.Sprintf("检查项 %s 的 pattern 为空（空正则匹配一切），已跳过", c.ID)
+		}
+		if _, err := compiled(pattern); err != nil {
+			return fmt.Sprintf("检查项 %s 的正则无法编译（%v），已跳过", c.ID, err)
+		}
+	case ExpectContains, ExpectNotContains:
+		if pattern == "" {
+			return fmt.Sprintf("检查项 %s 的 pattern 为空（空串匹配一切），已跳过", c.ID)
+		}
+	}
+	return ""
 }
 
 // AllChecks 展开所有集合里的检查项。

@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -42,12 +43,50 @@ func DefaultSettings() Settings {
 
 // SettingsService 读写用户设置。
 type SettingsService struct {
-	store *store.Store
+	store SettingsKV
+}
+
+// SettingsKV 是设置服务真正需要的存储能力（读一项、整批写）。
+//
+// 抽成接口不是为了"以后换数据库"，而是为了让**写入失败**这条路径可测：
+// 真实 store 是具体类型（*store.Store），没法只让某一项写失败。
+//
+// PutSettingsKV 是**一个事务写完整批**（store 侧实现保证失败整体回滚），
+// 所以现在只有"全成"和"全败"两种结局，不再有半新半旧的中间态。
+type SettingsKV interface {
+	GetSetting(key, def string) string
+	PutSetting(key, value string) error
+	PutSettingsKV(pairs [][2]string) error
 }
 
 // NewSettingsService 构造服务。
 func NewSettingsService(st *store.Store) *SettingsService {
 	return &SettingsService{store: st}
+}
+
+// NewSettingsServiceWithKV 用任意键值存储构造设置服务（测试注入故障用）。
+func NewSettingsServiceWithKV(st SettingsKV) *SettingsService {
+	return &SettingsService{store: st}
+}
+
+// SettingsWriteError 报告"哪些设置项没写进去"。
+//
+// 为什么要有类型而不是一句普通 error：控制面要靠它把失败项点名给用户（而不是
+// 只给一句"保存失败"）。**整批事务化之后只有"全成"与"全败"两种结局** ——
+// 这个类型在失败时 Failed 一定等于全部 key，AllFailed 恒真；保留它是为了
+// 让"哪些项"这件事仍然可达，以及测试能断言失败集合。
+type SettingsWriteError struct {
+	Failed []string // 写失败的设置项 key（按写入顺序）
+	Total  int      // 这一次一共尝试写了多少项
+}
+
+func (e *SettingsWriteError) Error() string {
+	return fmt.Sprintf("这些设置项保存失败：%s", strings.Join(e.Failed, "、"))
+}
+
+// AllFailed 报告是不是**一项都没写进去**。
+func (e *SettingsWriteError) AllFailed() bool {
+	return e.Total > 0 && len(e.Failed) >= e.Total
 }
 
 // Get 读取设置（缺项回落到默认值），并**夹取到合法范围**。
@@ -75,12 +114,17 @@ func (s *SettingsService) Get() Settings {
 	}
 }
 
-// Update 保存设置，并把数值夹取到合法范围后返回实际生效值。
+// Update 保存设置，并把数值夹取到合法范围后返回**实际生效的设置**。
 //
-// 返回 error：以前 9 处 `_ = s.store.PutSetting` 全吞错，函数也没有 error ——
-// 实测库关掉之后调 Update 仍返回一份"看起来已保存"的设置，而 Get 回读还是旧值，
-// 用户会以为默认下载目录已经生效。现在任一写入失败都会带回来（值仍然照写，
-// 能写的部分不回滚，但调用方知道"这次没全保存成功"）。
+// 写入走 store.PutSettingsKV —— **整批一个事务**：要么全生效、要么全不生效。
+// 以前是 9 次 `_ = s.store.PutSetting`，既吞错又会留下"有些新、有些旧"的中间态，
+// 而控制面回 502 时前端只在 200 才更新 window.AWD_SETTINGS，于是界面显示旧值、
+// 用户再保存一次就把已经生效的项改回去（复审 M4）。
+//
+// 返回 error：现在只有"全成"（nil）与"全败"（*SettingsWriteError，Failed 列出
+// 全部 key）两种。失败时也照常回读一份实际的 Settings，但调用方应当走 502 ——
+// 库这一刻很可能读不出来，Get 会回落成默认值，把默认值当"实际设置"显示出去
+// 等于把用户的设置弄丢了。
 func (s *SettingsService) Update(in Settings) (Settings, error) {
 	in.ConnKeepDays = clamp(in.ConnKeepDays, 0, 3650)
 	in.ConnKeepMax = clamp(in.ConnKeepMax, 0, 100000)
@@ -96,7 +140,7 @@ func (s *SettingsService) Update(in Settings) (Settings, error) {
 	if in.TermTrackCwd {
 		track = "true"
 	}
-	pairs := []struct{ k, v string }{
+	pairs := [][2]string{
 		{"app.conn_keep_days", strconv.Itoa(in.ConnKeepDays)},
 		{"app.conn_keep_max", strconv.Itoa(in.ConnKeepMax)},
 		{"app.event_keep_days", strconv.Itoa(in.EventKeepDays)},
@@ -106,16 +150,17 @@ func (s *SettingsService) Update(in Settings) (Settings, error) {
 		{"app.term_track_cwd", track},
 		{"app.download_dir", strings.TrimSpace(in.DownloadDir)},
 	}
-	var failed []string
-	for _, p := range pairs {
-		if err := s.store.PutSetting(p.k, p.v); err != nil {
-			failed = append(failed, p.k)
+	if err := s.store.PutSettingsKV(pairs); err != nil {
+		// 原始原因进日志：对外只报"哪些项没保存"，但那句 store 报错
+		//（库被锁、磁盘只读…）是排查时唯一有用的线索，不能丢。
+		log.Printf("保存设置失败（整批已回滚）: %v", err)
+		failed := make([]string, 0, len(pairs))
+		for _, p := range pairs {
+			failed = append(failed, p[0])
 		}
+		return s.Get(), &SettingsWriteError{Failed: failed, Total: len(pairs)}
 	}
-	if len(failed) > 0 {
-		return in, fmt.Errorf("这些设置项保存失败：%s", strings.Join(failed, "、"))
-	}
-	return in, nil
+	return s.Get(), nil
 }
 
 func (s *SettingsService) intVal(key string, def int) int {

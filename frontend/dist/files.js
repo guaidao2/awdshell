@@ -65,8 +65,21 @@
     var res = await fetch(API + path, opt);
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
-      try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 忽略 */ }
-      throw new Error(msg);
+      try {
+        var j = await res.json();
+        if (j && j.error) {
+          msg = j.error;
+        } else if (j && j.failed && j.failed.length) {
+          // /api/files/delete 的"部分失败"回的是 {deleted, failed:[{path,error}], ok, trashed}
+          // —— **顶层没有 error 字段**，不认 failed 就只能给用户一句 "409 Conflict"，
+          // 哪条路径、为什么失败全丢（终审实测就是这个结果）。
+          msg = j.failed.map(function (f) { return f.path + '：' + f.error; }).join('\n');
+        }
+      } catch (e) { /* 非 JSON */ }
+      // 挂状态码：删除的"部分失败"回 409，调用方要能分辨"整体失败"与"删了但有别的失败"。
+      var fErr = new Error(msg);
+      fErr.status = res.status;
+      throw fErr;
     }
     return res.json();
   }
@@ -425,7 +438,18 @@
       await req('/api/files/delete', { method: 'POST', body: JSON.stringify({ target_id: state.targetId, paths: [entry.path], trash: trash }) });
       await loadDir(state.path);
       setStatus(trash ? '已移入回收站：' + entry.name : '已删除：' + entry.name);
-    } catch (e) { window.AwdToast.error('删除失败\n\n' + e.message); }
+    } catch (e) {
+      // 409 = 部分失败（`{deleted, failed:[{path,error}]}`，`req` 已经把 failed 逐条展开进
+      // message）。删除是逐条执行的，所以**不能**笼统报"删除失败"就完事 —— 得刷新列表、
+      // 把实际状态摆出来，否则用户会以为文件还在（或以为删掉了）。
+      if (e.status === 409) {
+        await loadDir(state.path);
+        setStatus('删除未完全成功：' + entry.name);
+        window.AwdToast.error('删除未成功\n\n' + e.message);
+        return;
+      }
+      window.AwdToast.error('删除失败\n\n' + e.message);
+    }
   }
 
   async function doDownload(entry) {

@@ -83,7 +83,11 @@
     if (!res.ok) {
       var msg = res.status + ' ' + res.statusText;
       try { var j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* 忽略 */ }
-      throw new Error(msg);
+      // 挂状态码：409 是"该目标上一次采样还在跑，这一轮跳过"，不是"采集失败"。
+      // 各视图各有一份 req，app.js 那份不服务这里 —— 只改 app.js 等于没改。
+      var mErr = new Error(msg);
+      mErr.status = res.status;
+      throw mErr;
     }
     return res.json();
   }
@@ -516,6 +520,13 @@
         (state.auto ? '' : '　手动刷新') + note);
     } catch (e) {
       if (seq !== state.loadSeq || tid !== state.targetId) return;
+      // 409 = 该目标上一次采样还在跑（后端按目标加锁，最长约 27 秒）。
+      // 这不是"采集失败"：数据没坏、下一轮就会拿到。画成红色错误会让用户
+      // 以为监控坏了，切目标时尤其明显（A 采样中切到 B，B 立刻红一次）。
+      if (e.status === 409) {
+        setStatus('监控：该目标上一次采样还没结束，这一轮跳过，稍后自动重试');
+        return;
+      }
       var body = $('mo-body');
       if (body && !$('mo-err')) {
         body.insertAdjacentHTML('afterbegin', '<div class="mo-empty error-text" id="mo-err">采集失败：' + esc(e.message) + '</div>');

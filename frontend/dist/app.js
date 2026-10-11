@@ -71,7 +71,11 @@
           msg = j.failed.map(function (f) { return f.path + "：" + f.error; }).join("\n");
         }
       } catch (e) { /* 非 JSON */ }
-      throw new Error(msg);
+      // 错误对象带上状态码：调用方要按语义分支 —— 例如监控的 409 意思是
+      // "上一次采样还没结束，这一轮跳过"，不是"采集失败"。只靠错误文案判断太脆。
+      var reqErr = new Error(msg);
+      reqErr.status = res.status;
+      throw reqErr;
     }
     return res.json();
   }

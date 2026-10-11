@@ -29,6 +29,21 @@ type Pool struct {
 	// 只会一直挂着直到进程结束。以前只清 map 不设标志，实测 CloseAll 之后
 	// Acquire 仍会重新 dial 并插进池里，那些连接永远没人回收。
 	closed bool
+	// orphans 是"探活失败、已从池里摘出、但还有持有者"的连接。
+	//
+	// 为什么要单独记：dropIf 在 holders>0 时不能关（那是用户正在敲的终端、
+	// 上传中的 SFTP、跑一半的合规），但也不能留在池里（Acquire 会把它当可用
+	// 再发出去，而"探活失败"这个事实已经丢了）。摘出之后它既不在 conns 里、
+	// 也没人管，只能等持有者释放时关闭 —— 否则这条 TCP 与 x/crypto 的 mux
+	// goroutine 就永远漏着（审计实测：DropIf 后、release() 后、CloseAll() 后
+	// closed 一直是 0，因为 CloseAll 只遍历 conns）。
+	orphans map[*ssh.Client]*orphanConn
+}
+
+// orphanConn 是已摘出池、等持有者释放后关闭的连接。
+type orphanConn struct {
+	client  *ssh.Client
+	holders int
 }
 
 // ErrPoolClosed 是"连接池已关停"的哨兵错误。
@@ -137,9 +152,14 @@ func (p *Pool) Acquire(key string, dial func() (*ssh.Client, error)) (*ssh.Clien
 			if alive {
 				return client, nil
 			}
-			p.dropIf(key, client) // 已被换掉就不动别人的
-			_ = client.Close()    // 探活失败的这条无论如何都不能再用了
-			continue              // 下一轮重新握手
+			// **不能在这里无条件 Close**：dropIf 在 holders>0 时已经把它从池里
+			// 摘出（但不关，因为持有者还在用），这里再关一次就把 holders 保护
+			// 整个绕过了 —— 日志写着"不主动关闭，避免掐断正在用的终端/SFTP"，
+			// 紧接着自己把它关了（审计实测：Hold 住之后 Acquire 一次，closed=1）。
+			// 有持有者的那条由 dropIf 记进 orphans，等持有者释放时关闭；
+			// 没有持有者的那条 dropIf 已经关掉了。
+			p.dropIf(key, client)
+			continue // 下一轮重新握手
 		}
 		p.mu.Unlock()
 
@@ -196,10 +216,19 @@ func (p *Pool) Hold(client *ssh.Client) func() {
 		p.mu.Unlock()
 		return func() {}
 	}
+	held := false
 	for _, c := range p.conns {
 		if c.client == client {
 			c.holders++
+			held = true
 			break
+		}
+	}
+	// 已经在 orphan 里的（探活失败被摘出、持有者还没放完）也要计数，
+	// 否则 release 时计数对不上，那条连接永远不会被关。
+	if !held {
+		if o, ok := p.orphans[client]; ok {
+			o.holders++
 		}
 	}
 	p.mu.Unlock()
@@ -207,16 +236,36 @@ func (p *Pool) Hold(client *ssh.Client) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			var toClose *ssh.Client
 			p.mu.Lock()
+			found := false
 			for _, c := range p.conns {
 				if c.client == client {
 					if c.holders > 0 {
 						c.holders--
 					}
+					found = true
 					break
 				}
 			}
+			// 不在池里：它可能已被 dropIf 摘成 orphan（探活失败、但当时还有持有者，
+			// 所以没关）。计数一旦归零就关掉 —— 否则这条 TCP 和 x/crypto 的 mux
+			// goroutine 永远漏着：它不在 conns 里，CloseAll 也遍历不到。
+			if !found {
+				if o, ok := p.orphans[client]; ok {
+					if o.holders > 0 {
+						o.holders--
+					}
+					if o.holders == 0 {
+						delete(p.orphans, client)
+						toClose = client
+					}
+				}
+			}
 			p.mu.Unlock()
+			if toClose != nil {
+				_ = toClose.Close()
+			}
 		})
 	}
 }
@@ -298,18 +347,30 @@ func (p *Pool) dropIf(key string, client *ssh.Client) {
 	}
 	if c.holders > 0 {
 		holders := c.holders
-		// **摘出池，但不 Close。**
+		// **摘出池，但不 Close，并记进 orphans。**
 		//
 		// 不能 Close：持有者（终端/上传/合规）手里这条 client 还在用，关掉等于掐断
 		// 用户正在敲的终端。也不能留在池里：Acquire 的第二轮会因为 lastPing 刚被刷过
 		// 而不再探活，于是把这条**已知死连接**原样递给调用方（实测 got==dead、dialed=0），
 		// 之后每个 pingInterval（15 秒）重复一次，而日志还说"先不丢弃"——与事实相反。
 		//
-		// 摘出去之后：持有者自然收尾，新调用方下一轮会重新 dial。计数不再归零也无妨
-		//（它已不在池里，reaper 也不再看它）。
+		// 摘出去之后记进 orphans：持有者释放（holders 归零）时由 Hold 的 release
+		// 负责关掉。不记的话这条连接既不在 conns 里、也没人管，TCP 与 mux goroutine
+		// 就永远漏着。
+		if p.orphans == nil {
+			p.orphans = map[*ssh.Client]*orphanConn{}
+		}
+		// 已经在 orphan 里说明是第二次摘出：保留原有计数，别把持有者数冲掉。
+		if o, dup := p.orphans[c.client]; dup {
+			if holders > o.holders {
+				o.holders = holders
+			}
+		} else {
+			p.orphans[c.client] = &orphanConn{client: c.client, holders: holders}
+		}
 		delete(p.conns, key)
 		p.mu.Unlock()
-		log.Printf("sshx: 连接 %s 探活失败但仍被 %d 个使用方持有，已从池中摘出（不主动关闭，避免掐断正在用的终端/SFTP）；下次请求会重新建连", key, holders)
+		log.Printf("sshx: 连接 %s 探活失败但仍被 %d 个使用方持有，已从池中摘出（持有者释放后关闭）；下次请求会重新建连", key, holders)
 		return
 	}
 	delete(p.conns, key)
@@ -329,9 +390,19 @@ func (p *Pool) CloseAll() {
 		list = append(list, c)
 	}
 	p.conns = map[string]*pooled{}
+	// orphan 也要一并关：它们不在 conns 里，只遍历 conns 会让这些连接
+	// 活着离开进程（TCP 挂着、mux goroutine 没退）。
+	orphans := make([]*ssh.Client, 0, len(p.orphans))
+	for _, o := range p.orphans {
+		orphans = append(orphans, o.client)
+	}
+	p.orphans = nil
 	p.mu.Unlock()
 	for _, c := range list {
 		_ = c.client.Close()
+	}
+	for _, c := range orphans {
+		_ = c.Close()
 	}
 }
 

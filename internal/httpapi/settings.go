@@ -4,7 +4,24 @@ import (
 	"errors"
 	"io"
 	"net/http"
+
+	"github.com/guaidao2/awdshell/internal/service"
 )
+
+// settingsResponse 是 POST /api/settings 的响应：**实际生效的设置**
+// （扁平字段，与 GET /api/settings 同构，前端现有代码直接读 conn_keep_days 这些
+// 字段），外加一个 failed 数组说明这次哪些项没写进去。
+//
+// 为什么成功路径也要回读值（复审 M4）：逐项写、失败不回滚，库里可能已经是
+// "有些新、有些旧"的混合状态。前端里 window.AWD_SETTINGS 只在 200 时更新
+// （frontend/dist/settings.js 的 save()），所以响应必须给出**回读到的实际值**；
+// 给提交值、或者干脆回 502 让前端保持旧值，用户再点一次保存就会把已经生效的
+// 项改回去（界面显示旧值 → 提交旧值 → 覆盖新值）。
+type settingsResponse struct {
+	service.Settings
+	// Failed 列出这次没写进去的设置项 key（全写成功时是空数组）。
+	Failed []string `json:"failed"`
+}
 
 // handleSettings 读写用户设置。
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -66,10 +83,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		updated, err := s.Settings.Update(cur)
 		if err != nil {
+			// 写入是整批一个事务，只有"全成"与"全败"两种，所以这里一律 502。
+			// 不能回 200 + 回读值 —— 库这一刻很可能读不出来（锁住/只读/关掉了），
+			// Get 会回落成默认值，把默认值当"实际设置"回给前端等于把用户的设置显示丢了。
 			writeErr(w, http.StatusBadGateway, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, updated)
+		writeJSON(w, http.StatusOK, settingsResponse{Settings: updated, Failed: []string{}})
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)

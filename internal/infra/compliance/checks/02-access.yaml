@@ -56,12 +56,23 @@ checks:
     category: 访问控制
     severity: medium
     refs: ["等保 8.1.4.2 访问控制", "CIS 1.3.1"]
-    command: "grep -rhE 'NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -n5"
+    # 不能拿管道收尾（`| head -n5`）：普通账号读 /etc/sudoers（0440 root:root）与
+    # /etc/sudoers.d（0750 root:root）一律 EACCES，grep 以 2 退出，而管道的退出码
+    # 取的是 head 的 0 —— 于是"读不到"被当成"读到了、是空的"，这条 medium 检查
+    # 在非 root 登录下静默显示"符合"。改用 grep 自带的 -m 限量，退出码就是 grep 的。
+    #
+    # 再用 `|| true` + 自报可读性（复审 中2）：grep 无匹配退出 1 时 RunOutput 会
+    # 返回 ExitError，判定端在 err != nil 处就返回 error —— 干净 + root 的机器上
+    # 这一条也从来 pass 不了（"检查命令执行失败：exit status 1"）。
+    # pattern 里同时认 NOPASSWD 与 __AWD_READ_DENIED__，是判定端那层
+    # 「需要 root」处理的**双保险**（判定端先把标记摘掉）。
+    command: "if [ -r /etc/sudoers ] && { [ ! -e /etc/sudoers.d ] || [ -r /etc/sudoers.d ]; }; then grep -rhE -m 5 'NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true; echo __AWD_READ_OK__; else echo __AWD_READ_DENIED__; fi"
     expect:
       type: regex_not_match
-      pattern: '(?i)nopasswd'
+      pattern: '(?i)(nopasswd|__AWD_READ_DENIED__)'
     remedy: "去掉 sudoers 中的 NOPASSWD 标记，让提权操作需要再次输入口令。"
-    note: "自动化运维场景常有例外，请结合实际情况判断。"
+    note: "自动化运维场景常有例外，请结合实际情况判断。非 root 登录时读不到 sudoers，结果会标成「需 root」。"
+    needs_root: true
 
   - id: CHK-AC-006
     title: "关键目录下不存在全局可写文件"

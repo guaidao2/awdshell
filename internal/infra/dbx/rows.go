@@ -96,16 +96,69 @@ func checkIdent(s string) error {
 //
 // 之前的白名单允许逗号与空格，于是 "int, evil text" 能塞进额外列定义
 // （虽然起不了新语句 —— 分号挡住了 —— 但它能改写列清单的形状，名实不符）。
-var typeRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_ ]*(\(\s*\d+(\s*,\s*\d+)?\s*\))?(\[\])?$`)
+//
+// 再收一次（审计 第 11 条）：上一版是 `[A-Za-z][A-Za-z0-9_ ]*`，等于放行任意
+// 词序列 —— 实测 `int PRIMARY KEY`、`int REFERENCES other`、`text DEFAULT 5`
+// 全都能过。它们会被原样拼进 CREATE TABLE 的列定义里（`parts := []string{col.Name, col.Type}`），
+// 于是用户可以借"类型"这个字段写列级约束：`id int PRIMARY KEY` 能顶掉我们
+// 自己生成的 PRIMARY KEY 子句、`REFERENCES other` 能建外键、`DEFAULT 5` 能改默认值。
+//
+// 现在的形状是"基础类型名 [+ 合法的修饰词] + 可选 (数字[,数字]) + 可选修饰词 + 可选 []"：
+//   - 基础类型名必须第一个字符是字母；
+//   - 修饰词每个都必须是**类型相关的词**（unsigned / precision / varying …），
+//     并且**不能是 SQL 关键字或列级约束**（PRIMARY / KEY / REFERENCES / DEFAULT /
+//     NOT / NULL / UNIQUE / CHECK / COLLATE / GENERATED / CONSTRAINT …）。
+//
+// 为什么不能只靠"空格只允许一个"来收（审计第 11 条只说了一个空格）：
+//   - 一个空格放得下 `int UNIQUE`、`int CHECK`、`text DEFAULT` 这类单关键字约束，
+//     而它们照样能改写列定义；反过来 `int unsigned zerofill` 是 MySQL 的**正常写法**，
+//     一刀切成"最多一个词"会把它误挡。所以判据落在**词的种类**上，而不是词数上。
+//   - 括号里只允许数字与一个逗号（`numeric(10,2)`）。
+//   - 修饰词**可以出现在括号之后**（复审 低4）：`decimal(10,2) unsigned` 是
+//     MySQL 合法且常见的写法，以前只允许括号前有修饰词，于是它被当成
+//     "字段类型写法不支持"挡下 —— 而用户只是照 MySQL 文档写了个金额列。
+//     括号前后各自限 3 个词，**两边的词都要过 deny 名单**（见 typeWords）。
+var typeRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*( [A-Za-z][A-Za-z0-9_]*){0,3}(\(\s*\d+(\s*,\s*\d+)?\s*\))?( [A-Za-z][A-Za-z0-9_]*){0,3}(\[\])?$`)
 
-// escapeString 转义字符串字面量。
+// typeWordDeny 是"绝不能出现在类型里的词"：SQL 关键字与列级约束。
+//
+// 类型字段会被原样拼进 CREATE TABLE 的列定义（`col.Name col.Type`），
+// 于是这些词能借它改写列定义：`id int PRIMARY KEY` 顶掉我们自己的 PRIMARY KEY
+// 子句、`REFERENCES other` 建外键、`DEFAULT 5` 改默认值、`NOT NULL` 改可空性 ——
+// 审计实测这三种（int PRIMARY KEY / int REFERENCES other / text DEFAULT 5）全放行。
+var typeWordDeny = map[string]bool{
+	"primary": true, "key": true, "foreign": true, "references": true,
+	"unique": true, "check": true, "default": true, "not": true, "null": true,
+	"collate": true, "constraint": true, "generated": true, "identity": true,
+	"auto_increment": true, "comment": true, "on": true, "delete": true,
+	"update": true, "cascade": true, "restrict": true, "no": true, "action": true,
+	"as": true, "stored": true, "virtual": true, "using": true, "index": true,
+	"select": true, "insert": true, "drop": true, "alter": true, "create": true,
+	"table": true, "values": true, "set": true, "where": true, "then": true,
+}
+
+// escapeString 转义字符串字面量（MySQL 口径：反斜杠是转义符）。
 //
 // MySQL/MariaDB 默认 sql_mode 下反斜杠是字符串里的转义符
 // （NO_BACKSLASH_ESCAPES 不在默认值里），只翻倍单引号的话，
 // 默认值填 C:\temp\ 这种就把语句拼坏了（字符串未闭合，报 1064）。
-// PostgreSQL 的 standard_conforming_strings=on 不受反斜杠影响，一起转义也无害。
+//
+// **PG 不能这么转**（审计 第 12 条）：PostgreSQL 的 standard_conforming_strings
+// 默认 on，普通 '...' 字面量里 `\` 就是普通字符；再翻倍等于把 `C:\temp` 存成
+// `C:\\temp`（多一个反斜杠，用户看到的是错值）。按方言转义见 escapeFor。
 func escapeString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// escapeFor 按连接方言转义字符串字面量。
+//
+// 单引号一律翻倍（两种方言都这样）；反斜杠只有 MySQL 系需要翻倍。
+// 只影响 CreateTable 里拼进去的 DEFAULT / COMMENT —— 值本身仍走占位符。
+func (c *Conn) escapeFor(s string) string {
+	if c.kind == KindMySQL {
+		return escapeString(s)
+	}
 	return strings.ReplaceAll(s, "'", "''")
 }
 
@@ -118,7 +171,27 @@ func checkType(s string) error {
 	if !typeRe.MatchString(t) {
 		return fmt.Errorf("这个字段类型写法不支持：%s（示例：varchar(64)、int、numeric(10,2)、timestamp、text）", t)
 	}
+	// 形状对了还要看词：类型里绝不能出现 SQL 关键字/列级约束
+	//（`int UNIQUE`、`text DEFAULT` 这类一个空格就够，光靠形状拦不住，见 typeWordDeny）。
+	for _, w := range typeWords(t) {
+		if typeWordDeny[w] {
+			return fmt.Errorf("字段类型里不能带 %q（那是列级约束/关键字，不是类型）：%s", w, t)
+		}
+	}
 	return nil
+}
+
+// typeWords 取类型里的纯词（括号里的数字参数不算词）。
+//
+// **不能在第一个 `(` 处截断**：现在允许修饰词写在括号之后
+// （`decimal(10,2) unsigned`），截断就等于让括号后面的词整段绕过 deny 名单 ——
+// `varchar(64) primary key` 会被放行并原样拼进 CREATE TABLE 的列定义，
+// 顶掉我们自己生成的主键子句（那正是 typeWordDeny 存在的理由）。
+// 这里把括号与逗号都换成空格：精度数字 "10,2" 变成两个纯数字 token，
+// 它们不在 deny 名单里，判定不受影响。
+func typeWords(s string) []string {
+	s = strings.NewReplacer("(", " ", ")", " ", ",", " ").Replace(s)
+	return strings.Fields(strings.ToLower(s))
 }
 
 // ColumnsInfo 读字段详情（含主键与自增标记）。
@@ -609,7 +682,9 @@ func (c *Conn) CreateTable(ctx context.Context, spec TableSpec) error {
 			if isNumericOrKeyword(d) {
 				parts = append(parts, "DEFAULT "+d)
 			} else {
-				parts = append(parts, "DEFAULT '"+escapeString(d)+"'")
+				// 按方言转义：PG 的 standard_conforming_strings=on 下反斜杠不是转义符，
+				// 一起翻倍会把 C:\temp 存成 C:\\temp（审计 第 12 条）。
+				parts = append(parts, "DEFAULT '"+c.escapeFor(d)+"'")
 			}
 		}
 		defs = append(defs, strings.Join(parts, " "))

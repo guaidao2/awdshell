@@ -679,6 +679,9 @@ label { color: var(--text-secondary); font-size: 12px; }
 .ls-lines { width: 140px; }
 .ls-hint { color: var(--text-muted); font-size: 11.5px; margin-left: auto; }
 .ls-hint.error-text { color: var(--danger); }
+/* 中间态：需要留意但不算失败（例如"扫描超时、结果不完整"）。
+   用红色会和真正的"检测失败"混淆，用灰又不够显眼。 */
+.ls-hint.warn { color: var(--warning); }
 
 .ls-body { display: flex; flex-direction: column; gap: 12px; }
 .ls-empty {

@@ -8,6 +8,8 @@
      低9 monitor.js：下拉切目标没有重置 lastOkAt，"距上次 N 秒"会跨主机算
    每条都写成"改回错误版本会红"的形式。 */
 'use strict';
+const fs = require('fs');
+const path = require('path');
 const { createEnv, ok } = require('./harness');
 
 const PAY = '<img src=x onerror=window.__PWN=1>';
@@ -203,6 +205,49 @@ async function caseLogscanEscape() {
     html.indexOf('corr-meta') >= 0 && html.indexOf('&amp;lt;') < 0);
 }
 
+// ---------- 前端一致性：8 份 req 的能力必须一致 ----------
+//
+// awdshell 的 8 个脚本**各有自己的一份 `req`**（app.js 那份不服务其它视图），
+// 于是同一个修复要改 8 处 —— 已经因此漏过两次，都是终审抓出来的：
+//   1) 只给 app.js 挂了 `res.status` → monitor.js 的 `if (e.status === 409)`
+//      成了死代码，切目标时照样报红色"采集失败"；
+//   2) 只给 app.js 展开了 `failed[]` → files.js 删除失败（409 的响应体**没有
+//      error 字段**，只有 failed）只显示一句 "409 Conflict"，哪条路径为什么失败全丢。
+//
+// 这两条都是"代码看起来对了、跑起来没人管"的类型，所以用静态一致性检查盯住它们。
+//
+// **这条检查的能力边界（实测过，别高估）**：它是"存在性检查"，不是"可达性检查" ——
+// 把分支短路成 `false && j.failed` 它照样通过。但实际发生过的两次漏改都是
+// **整处没写**（一份 req 完全没有 status / 完全没有 failed 分支），那种形态它抓得住。
+// 要抓死代码得真把 files.js 在假 DOM 里跑起来，成本明显更高，先不做。
+async function caseReqConsistency() {
+  console.log('--- 前端一致性）8 份 req：都挂 status，会删文件的那份要展开 failed ---');
+  const all = ['app.js', 'compliance.js', 'database.js', 'files.js', 'logscan.js',
+    'monitor.js', 'settings.js', 'threat.js'];
+  const src = {};
+  for (const f of all) {
+    src[f] = fs.readFileSync(path.join(__dirname, '..', 'dist', f), 'utf8');
+    check(f + ' 的 req 挂了 res.status', /\.status\s*=\s*res\.status/.test(src[f]));
+  }
+  // 老写法残留 = 有文件漏改（只要还 throw 裸 Error，调用方就拿不到状态码）
+  for (const f of all) {
+    if (f === 'app.js') continue; // app.js 在 !res.ok 里走的是 reqErr，下面单独看
+    check(f + ' 没有残留裸 throw new Error(msg)',
+      !/throw new Error\(msg\)/.test(src[f]));
+  }
+  check('app.js 也挂了 res.status', /\.status\s*=\s*res\.status/.test(src['app.js']));
+
+  // /api/files/delete 的 409 响应体只有 {ok,trashed,deleted,failed} —— **没有 error**。
+  // 谁调它，谁的 req 就必须认 failed，否则失败原因看不见。
+  const deleteCallers = all.filter(f => /\/api\/files\/delete/.test(src[f]));
+  check('至少有一个脚本会调 /api/files/delete', deleteCallers.length > 0, deleteCallers.join(','));
+  for (const f of deleteCallers) {
+    check(f + '（会调 delete）的 req 展开了 failed[]', /j\.failed/.test(src[f]));
+  }
+  // monitor.js 会调 /api/monitor，409 要能按状态码分支
+  check('monitor.js 按 e.status 分支处理 409', /e\.status\s*===\s*409/.test(src['monitor.js']));
+}
+
 (async () => {
   try {
     await caseWsGuard();
@@ -210,6 +255,7 @@ async function caseLogscanEscape() {
     await caseMonitorEscape();
     await caseMonitorSwitchTarget();
     await caseLogscanEscape();
+    await caseReqConsistency();
   } catch (e) {
     console.log('  FAIL harness error: ' + (e && e.stack || e));
     fails++;
