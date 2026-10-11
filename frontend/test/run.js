@@ -248,6 +248,77 @@ async function caseReqConsistency() {
   check('monitor.js 按 e.status 分支处理 409', /e\.status\s*===\s*409/.test(src['monitor.js']));
 }
 
+// ---------- 终端快捷键：一次按键只做一件事 ----------
+//
+// 症状（作者实测）：Ctrl+Shift+V 会粘贴两次。
+//
+// 根因：Chromium / WebView2 把 Ctrl+Shift+V（以及 Shift+Insert）也当成"粘贴"，
+// 会在 xterm 的输入框上再派发一次 paste 事件、xterm 照单全收。而
+// attachCustomKeyEventHandler 返回 false **只**表示"别把它当按键发给远端"，
+// 并不阻止浏览器默认行为 —— 于是"读剪贴板粘一次 + xterm 自己粘一次"。
+//
+// 这条用例能跑起来的前提是 harness 的 Terminal 替身实现了
+// attachCustomKeyEventHandler：此前它没有这个方法，typeof 判断为假、
+// handler 从未注册，所以整个终端快捷键路径在测试里是空白。
+async function caseTermKeyHandler() {
+  console.log('--- 终端快捷键）粘贴键必须 preventDefault，否则一次按键粘两遍 ---');
+  const env = createEnv({ navigator: { clipboard: { readText: async () => 'PASTED' } } });
+  env.sandbox.fetch = async function (url) {
+    const u = String(url);
+    let body = {};
+    if (u.indexOf('/api/settings') >= 0) body = {};
+    else if (u.indexOf('/api/targets') >= 0) body = [{ id: 't1', name: 'A', host: 'h', port: 22, username: 'u' }];
+    else if (u.indexOf('/api/recent') >= 0) body = [];
+    else if (u.indexOf('/api/history') >= 0) body = [];
+    else if (u.indexOf('/api/files/startdir') >= 0) body = { path: '', source: 'none' };
+    else if (u.indexOf('/api/sessions') >= 0) body = { session_id: 's1', target_id: 't1', title: 'A', ws_token: 'tok1' };
+    return ok(body);
+  };
+  env.load('app.js');
+  await env.sleep(30);
+  env.el('sidebar-body').fire('click', { target: { closest: () => ({ dataset: { act: 'connect', id: 't1' } }) } });
+  await env.sleep(30);
+
+  const term = env.terminals[0];
+  check('Terminal 替身注册上了按键处理（此前缺这个方法，整个快捷键路径没被测过）',
+    typeof term._keyHandler === 'function');
+  if (typeof term._keyHandler !== 'function') return;
+
+  const mkEv = over => Object.assign({
+    type: 'keydown', key: 'v', ctrlKey: true, shiftKey: true, metaKey: false,
+    defaultPrevented: false,
+    preventDefault: function () { this.defaultPrevented = true; }
+  }, over || {});
+
+  for (const [label, ev] of [
+    ['Ctrl+Shift+V', mkEv()],
+    ['Shift+Insert', mkEv({ key: 'Insert', ctrlKey: false })]
+  ]) {
+    const ret = term._keyHandler(ev);
+    check(label + ' 阻止了浏览器默认粘贴（不拦就会再粘一次）', ev.defaultPrevented === true);
+    check(label + ' 不让 xterm 把按键当输入发给远端', ret === false);
+  }
+  await env.sleep(20);
+  check('剪贴板内容粘进了终端', term.pasted.join('|') === 'PASTED|PASTED', term.pasted.join('|'));
+
+  // 没有 clipboard API 的环境：不能拦默认行为，否则浏览器默认粘贴也被挡住、
+  // 整条粘贴路径彻底失效；但仍然不能让按键发给远端。
+  env.sandbox.navigator.clipboard = null;
+  const evNoApi = mkEv();
+  const retNoApi = term._keyHandler(evNoApi);
+  check('没有 clipboard API 时不拦默认行为（让浏览器默认粘贴兜底）', evNoApi.defaultPrevented === false);
+  check('没有 clipboard API 时仍不让按键发给远端', retNoApi === false);
+
+  // 这两条是作者明确要求过的语义，别被粘贴相关的改动带跑
+  check('Ctrl+C 仍然放行（永远是 SIGINT）',
+    term._keyHandler(mkEv({ key: 'c', shiftKey: false })) === true);
+  check('Ctrl+A 仍然不拦（shell 里是移到行首）',
+    term._keyHandler(mkEv({ key: 'a', shiftKey: false })) === true);
+  const evCopy = mkEv({ key: 'c' });
+  term._keyHandler(evCopy);
+  check('Ctrl+Shift+C 也拦了默认行为（浏览器会当"打开开发者工具"）', evCopy.defaultPrevented === true);
+}
+
 (async () => {
   try {
     await caseWsGuard();
@@ -256,6 +327,7 @@ async function caseReqConsistency() {
     await caseMonitorSwitchTarget();
     await caseLogscanEscape();
     await caseReqConsistency();
+    await caseTermKeyHandler();
   } catch (e) {
     console.log('  FAIL harness error: ' + (e && e.stack || e));
     fails++;

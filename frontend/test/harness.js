@@ -57,10 +57,21 @@ function mkTerminal() {
   return {
     // 记下终端里写过什么：断言"旧 socket 的 exit 有没有冒出一句假的连接已结束"
     written: [],
+    // 记下通过 term.paste() 粘进来的内容（终端快捷键的粘贴路径走这里）
+    pasted: [],
     open() { }, dispose() { }, loadAddon() { }, focus() { },
     write(b) { this.written.push(String(b)); },
     onData(f) { this._data = f; },
     onResize(f) { this._resize = f; },
+    // 终端快捷键：app.js 用 attachCustomKeyEventHandler 注册按键处理，
+    // 缺这个方法的话 typeof 判断为假、handler 根本不会注册 ——
+    // 快捷键相关的回归（例如"一次按键粘两遍"）就永远测不到。
+    attachCustomKeyEventHandler(f) { this._keyHandler = f; },
+    getSelection() { return this._sel || ''; },
+    hasSelection() { return !!this._sel; },
+    clearSelection() { this._sel = ''; },
+    selectAll() { },
+    paste(t) { this.pasted.push(String(t)); },
     parser: { registerOscHandler() { return true; } }
   };
 }
@@ -129,6 +140,10 @@ function createEnv(extra) {
       activeElement: null
     },
     location: { origin: 'http://127.0.0.1:9' },
+    // 默认没有 clipboard API（模拟"读不到剪贴板"的环境）；用例要用粘贴路径时
+    // 通过在 extra 里传 navigator 覆盖，从而能同时验"有 API 时 preventDefault"
+    // 与"没有 API 时放行浏览器默认粘贴"两条分支。
+    navigator: { clipboard: null },
     __AWDSHELL__: { apiBase: 'http://127.0.0.1:9', version: 'test', token: 'test-token' }
   };
   sandbox.window = sandbox;

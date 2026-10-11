@@ -762,20 +762,38 @@ async function renderHostKeyInfo(targetID) {
       // **Ctrl+C 永远放行**：它是 SIGINT，有选区残留时也要能中断命令。
       // 复制一律走 Ctrl+Shift+C（Linux 终端惯例），Ctrl+Insert 作为老习惯保留。
       if (ctrl && e.shiftKey && (key === "c" || key === "C")) {
+        // 拦掉浏览器默认行为：Chromium 把 Ctrl+Shift+C 当"打开开发者工具"。
+        e.preventDefault();
         var sel = term.getSelection();
         if (sel) { copySelection(sel); return false; }
         return false;   // 没选区也拦，免得 Shift+Ctrl+C 被当成别的组合发下去
       }
       if (e.ctrlKey && key === "Insert") {
+        // Ctrl+Insert 在浏览器里也是"复制"，一并拦掉（复制两次虽无感，
+        // 但"一次按键只做一件事"要保持一致）。
+        e.preventDefault();
         var sel2 = term.getSelection();
         if (sel2) { copySelection(sel2); return false; }
         return true;
       }
       // 粘贴：Ctrl+Shift+V / Shift+Insert。
-      // 裸 Ctrl+V 交给浏览器默认的 paste 事件（xterm 自己会处理），不要拦。
-      if ((ctrl && e.shiftKey && (key === "v" || key === "V")) || (e.shiftKey && key === "Insert")) {
+      //
+      // **必须 preventDefault**，否则一次按键会粘两遍：Chromium / WebView2 把
+      // Ctrl+Shift+V（以及 Shift+Insert）也当成"粘贴"，会在 xterm 的输入框上再
+      // 派发一次 paste 事件、xterm 照单全收 —— 于是"读剪贴板粘一次 + xterm 自己
+      // 粘一次"。`return false` 只表示"别把它当按键发给远端"，并不阻止浏览器默认行为。
+      //
+      // 读不到剪贴板（环境没有 clipboard API）时不拦，让浏览器默认的 paste 兜底，
+      // 免得整条粘贴路径都失效。裸 Ctrl+V 不在这里：交给浏览器默认的 paste。
+      var isPasteKey = (ctrl && e.shiftKey && (key === "v" || key === "V")) ||
+        (e.shiftKey && key === "Insert");
+      if (isPasteKey && navigator.clipboard && navigator.clipboard.readText) {
+        e.preventDefault();
         pasteFromClipboard();
         return false;
+      }
+      if (isPasteKey) {
+        return false;   // 没有 clipboard API：放行浏览器默认粘贴，但别发给远端
       }
       // 注意：**不要拦 Ctrl+A** —— shell 里它是「光标移到行首」，很重要的编辑键。
       // 全选走右键菜单。
