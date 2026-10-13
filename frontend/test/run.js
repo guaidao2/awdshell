@@ -317,6 +317,17 @@ async function caseTermKeyHandler() {
   const evCopy = mkEv({ key: 'c' });
   term._keyHandler(evCopy);
   check('Ctrl+Shift+C 也拦了默认行为（浏览器会当"打开开发者工具"）', evCopy.defaultPrevented === true);
+
+  // 输入字节本身也要对：回车是单个 CR(13)、Ctrl+C 是单个 0x03。
+  // 这两个字节要是发错（发成可见字符或别的编码），远端交互程序就认不出，
+  // 表现正是"回车变 ^M、Ctrl+C 变 ^C"。后端确认是原样写 stdin，所以这一侧要钉死。
+  term._data('\r');
+  term._data('\x03');
+  const sentBytes = env.sockets[0].sent
+    .filter(x => x && typeof x !== 'string')
+    .map(x => Array.from(x).join(','));
+  check('回车发出的是单个 CR(13)', sentBytes.indexOf('13') >= 0, sentBytes.join(' | '));
+  check('Ctrl+C 发出的是单个 0x03', sentBytes.indexOf('3') >= 0, sentBytes.join(' | '));
 }
 
 // ---------- 布局变化后终端要重新适配 ----------

@@ -417,6 +417,15 @@ func stubFunctionDefs(t *testing.T, bin string) string {
 	return b.String()
 }
 
+// scriptRunTimeout 是"跑一遍采集脚本"的上限。
+//
+// 正常一次只要 2 秒出头，但这里必须留足余量：`go test ./...` 会并行跑多个包，
+// 负载高时 shell 启动本身就会被拖慢 —— 实测在同时跑别的包测试时，这个脚本
+// 从 2.2 秒膨胀到 20 秒以上，撞上原来的 20 秒上限直接 Fatal（一次全量跑里
+// 偶发出现过）。超时只是"防挂死"的保险，放宽不会掩盖真问题：
+// 真卡住的时候 90 秒一样会触发。
+const scriptRunTimeout = 90 * time.Second
+
 // runScript 在"命令被替身覆盖"的环境里跑采集脚本，返回 stdout。
 //
 // 替身的生效**只**取决于上面那组函数，与 PATH 无关（见 stubFunctionDefs）。
@@ -435,9 +444,9 @@ func runScript(t *testing.T, shell, bin string) string {
 	}()
 	select {
 	case <-done:
-	case <-time.After(20 * time.Second):
+	case <-time.After(scriptRunTimeout):
 		_ = cmd.Process.Kill()
-		t.Fatal("采集脚本跑超时")
+		t.Fatal("采集脚本跑超时（" + scriptRunTimeout.String() + "）")
 	}
 	if err != nil {
 		t.Fatalf("跑采集脚本失败: %v（输出 %q）", err, string(out))

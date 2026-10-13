@@ -38,6 +38,61 @@ func (p *Pool) StartTerminalHeld(client *ssh.Client, cols, rows int, termName st
 	return t, nil
 }
 
+// ptyTerminalModes 是申请 PTY 时发给远端的 termios。
+//
+// **关键标志必须显式列出来，不能只给 ECHO。** ssh 的 pty-req 里 modes 的语义是
+// "客户端要求的 termios 值"，服务端逐项应用；**没有列出的项落到什么值并不保证**
+// （OpenSSH 是在 tty 当前值的基线上覆盖，但基线本身不一定是完整的 cooked 模式，
+// 不同实现更不一致）。只给 ECHO 时的实测表现：
+//
+//	回车显示成 ^M 且不生效（ICRNL 没开，CR 不会被转成 NL）
+//	Ctrl+C 显示成 ^C 且不中断（ISIG 没开，不产生 SIGINT）
+//	apt / vim / top 这类交互程序的按键全部对不上
+//
+// 下面的值对照 OpenSSH 客户端发出的 mode 表，也就是普通 Linux 终端的默认值。
+func ptyTerminalModes() ssh.TerminalModes {
+	return ssh.TerminalModes{
+		// 特殊字符（值就是它的字符码）
+		ssh.VINTR:    3,   // Ctrl+C
+		ssh.VQUIT:    28,  // Ctrl+\
+		ssh.VERASE:   127, // Backspace
+		ssh.VKILL:    21,  // Ctrl+U
+		ssh.VEOF:     4,   // Ctrl+D
+		ssh.VSTART:   17,  // Ctrl+Q
+		ssh.VSTOP:    19,  // Ctrl+S
+		ssh.VSUSP:    26,  // Ctrl+Z
+		ssh.VREPRINT: 18,  // Ctrl+R
+		ssh.VWERASE:  23,  // Ctrl+W
+		ssh.VLNEXT:   22,  // Ctrl+V
+		ssh.VDISCARD: 15,  // Ctrl+O
+
+		// 输入处理：ICRNL 决定"回车能不能当回车用"
+		ssh.ICRNL:   1,
+		ssh.IXON:    1,
+		ssh.IMAXBEL: 1,
+		ssh.IUTF8:   1,
+
+		// 本地处理：ISIG 决定 Ctrl+C 是否产生信号，ICANON 决定行编辑
+		ssh.ISIG:    1,
+		ssh.ICANON:  1,
+		ssh.ECHO:    1,
+		ssh.ECHOE:   1,
+		ssh.ECHOK:   1,
+		ssh.IEXTEN:  1,
+		ssh.ECHOCTL: 1,
+		ssh.ECHOKE:  1,
+
+		// 输出处理：ONLCR 决定换行之后要不要回到行首
+		ssh.OPOST: 1,
+		ssh.ONLCR: 1,
+
+		// 控制模式与速率
+		ssh.CS8:           1,
+		ssh.TTY_OP_ISPEED: 38400,
+		ssh.TTY_OP_OSPEED: 38400,
+	}
+}
+
 // StartTerminal 在已有连接上开一个带 PTY 的 shell。
 func StartTerminal(client *ssh.Client, cols, rows int, termName string) (*Terminal, error) {
 	if cols <= 0 {
@@ -55,12 +110,7 @@ func StartTerminal(client *ssh.Client, cols, rows int, termName string) (*Termin
 		return nil, fmt.Errorf("创建会话通道失败: %w", err)
 	}
 
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	if err := sess.RequestPty(termName, rows, cols, modes); err != nil {
+	if err := sess.RequestPty(termName, rows, cols, ptyTerminalModes()); err != nil {
 		sess.Close()
 		return nil, fmt.Errorf("申请 PTY 失败: %w", err)
 	}
