@@ -389,6 +389,49 @@ async function casePaneRefit() {
   check('连续多次变化被去抖成一次', env.fits.length === mid + 1, env.fits.length - mid);
 }
 
+// ---------- state 默认值：被 ++/-- 的字段必须在 state 里定义 ----------
+//
+// 症状（作者实测）：数据库面板里「测试连接」正常，但图形化操作什么都读不出来、
+// 连接历史也不显示。根因是 state 里漏了 connSeq / treeSeq 的初值 ——
+// `++undefined` 是 NaN，而 `NaN !== NaN` 恒为真，于是每次请求回来都在
+// "过期响应，丢弃"那一步 return，连接列表和库表树永远填不上。
+//
+// 同一类坑这个项目踩过第二次（第一次是漏 followActive 时 `!undefined` 恒为真）。
+// 这条静态检查把"凡是被 ++/-- 的 state 字段都必须有初值"钉住。
+function stateLiteralOf(src) {
+  const i = src.indexOf('state = {');
+  if (i < 0) return '';
+  let depth = 0, started = false;
+  for (let j = i; j < src.length; j++) {
+    const c = src[j];
+    if (c === '{') { depth++; started = true; }
+    else if (c === '}') { depth--; if (started && depth === 0) return src.slice(i, j + 1); }
+  }
+  return src.slice(i);
+}
+
+function caseStateDefaults() {
+  console.log('--- state 默认值）被 ++/-- 的字段必须在 state 里定义 ---');
+  const files = ['app.js', 'compliance.js', 'database.js', 'files.js',
+    'logscan.js', 'monitor.js', 'settings.js', 'threat.js'];
+  let sawAny = false;
+  for (const f of files) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'dist', f), 'utf8');
+    const used = new Set();
+    let m;
+    const re = /(?:\+\+|--)\s*state\.([A-Za-z_$][\w$]*)|state\.([A-Za-z_$][\w$]*)\s*(?:\+\+|--)/g;
+    while ((m = re.exec(src))) used.add(m[1] || m[2]);
+    if (!used.size) continue;
+    sawAny = true;
+    const lit = stateLiteralOf(src);
+    check(f + ' 找得到 state 字面量', lit.length > 0);
+    for (const k of used) {
+      check(f + ' 的 state.' + k + ' 有初值', new RegExp('(^|[\\s,{])' + k + '\\s*:').test(lit));
+    }
+  }
+  check('至少扫到一个自增的 state 字段（否则这条检查是空跑）', sawAny);
+}
+
 (async () => {
   try {
     await caseWsGuard();
@@ -399,6 +442,7 @@ async function casePaneRefit() {
     await caseReqConsistency();
     await caseTermKeyHandler();
     await casePaneRefit();
+    caseStateDefaults();
   } catch (e) {
     console.log('  FAIL harness error: ' + (e && e.stack || e));
     fails++;
